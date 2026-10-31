@@ -9,9 +9,9 @@
 #   0  sysinfo         cache topology, kernel config, timer, memory map
 #   A  DRAM latency    pointer chase 4 KiB .. 32 MiB on CPU 2, perf counters
 #   B  OCM latency     each region flushed, all five regions, SLC reference
-#   C  SPM             latency and ldr16/str16 bandwidth (non-cacheable)
 #   D  1-core bandwidth read/write/copy at L1, L2, L3, SLC, DRAM footprints; OCM
 #   E  multi-core      shared-L2 pair (2,3), one core per DSU (2,4,6,8), all 8
+#   C  SPM (last)      latency and ldr16/str16 bandwidth (non-cacheable)
 # CPU 3 is taken offline for A-D (CPU 2 then owns the DSU-1 L2 and L3) and
 # brought back for E. Hot-plug happens outside timed sections only.
 #
@@ -113,14 +113,6 @@ if [ "$HAVE_OCM" = 1 ]; then
     run latency-ocm-all5-fresh.csv "$LAT" --cpu $CPU --perf --mem ocm --ocm-regions 0,1,2,3,4 --sizes 1280K --fresh 3
 fi
 
-# ---- C. SPM ----
-if [ "$HAVE_SPM" = 1 ]; then
-    say "## C. SPM latency and bandwidth (cpu $CPU)"
-    run latency-spm.csv "$LAT" --cpu $CPU --perf --mem spm --loads 32K --reps 3 --sizes 64K,256K,1M
-    run bandwidth-spm.csv "$BW" --threads 1 --cpus $CPU --mem spm --bytes 1M --kernel ldr16 --passes 2 --reps 3
-    run bandwidth-spm.csv "$BW" --threads 1 --cpus $CPU --mem spm --bytes 1M --kernel str16 --passes 2 --reps 3
-fi
-
 # ---- D. one-core bandwidth ----
 say "## D. one-core bandwidth (cpu $CPU)"
 for sp in 16K:256 48K:128 96K:64 256K:32 2M:4 32M:2; do
@@ -153,6 +145,14 @@ done
 if [ "$HAVE_OCM" = 1 ]; then
     run bandwidth-ocm-4core.csv "$BW" --threads 4 --cpus 2,4,6,8 --mem ocm --ocm-regions 1,2,3,4 --bytes 256K --kernel read --flush-before --passes 1 --reps 3
     run bandwidth-ocm-4core.csv "$BW" --threads 4 --cpus 2,4,6,8 --mem ocm --ocm-regions 1,2,3,4 --bytes 256K --kernel write --flush-after --passes 1 --reps 3
+fi
+
+# ---- C. SPM (last: a wrong-size access would revoke the mapping and SIGBUS later passes) ----
+if [ "$HAVE_SPM" = 1 ]; then
+    say "## C. SPM latency and bandwidth (cpu $CPU)"
+    run latency-spm.csv "$LAT" --cpu $CPU --perf --mem spm --loads 32K --reps 3 --sizes 64K,256K,1M
+    run bandwidth-spm.csv "$BW" --threads 1 --cpus $CPU --mem spm --bytes 1M --kernel ldr16 --passes 2 --reps 3
+    run bandwidth-spm.csv "$BW" --threads 1 --cpus $CPU --mem spm --bytes 1M --kernel str16 --passes 2 --reps 3
 fi
 
 mv "$OUT/all.txt.tmp" "$OUT/all.txt" 2>/dev/null

@@ -72,24 +72,26 @@ Total size is a few tens of kilobytes.
 | A | DRAM latency, flushed single pass | 256 KiB to 8 MiB | latency when every load leaves the core caches |
 | B | OCM latency, flushed, one region at a time | 256 KiB | per-region latency; region 1 (one hop from DSU 1) expected fastest |
 | B | OCM latency, all five regions | 1.25 MiB | OCM latency across home nodes, flushed and fresh |
-| C | SPM latency and bandwidth | 64 KiB to 1 MiB | non-cacheable scratchpad latency; 16-byte load and store bandwidth |
 | D | one-core bandwidth read / write / copy | 16 KiB, 48 KiB, 96 KiB, 256 KiB, 2 MiB, 32 MiB | L1, L2, L3, SLC and DRAM bandwidth of one core |
 | D | OCM bandwidth | 256 KiB per region, 1.25 MiB all | read from OCM (flushed before), write + write-back, copy region 1 to 2 |
 | E | shared-L2 pair, CPUs 2 and 3 | 16 KiB, 48 KiB, 160 KiB each | whether two cores sharing L2 and L3 halve each other's bandwidth |
 | E | one core per DSU (2, 4, 6, 8) and all eight (2 to 9) | 2 MiB and 16 MiB per thread | aggregate SLC and DRAM bandwidth of the hemisphere |
 | E | OCM from four cores | one region per core | aggregate OCM read and write |
+| C (runs last) | SPM latency and bandwidth | 64 KiB to 1 MiB | non-cacheable scratchpad latency; 16-byte load and store bandwidth |
 
 ## Output format
 
 `latency` prints one CSV row per timed walk:
 
 ```
-mem,size_bytes,mode,rep,loads,ns_per_load,cycles_per_load,l1d_refill_per_load,l2d_refill_per_load,l3d_refill_per_load
+mem,size_bytes,mode,rep,loads,ns_per_load,cycles_per_load,l1d_refill_per_load,l2d_refill_per_load,l3d_refill_rd_per_load
 dram,131072,repeat,0,65536,3.75,10.5,1.0000,0.0100,0.0001
 ```
 
 `ns_per_load` is the latency. The refill columns come from the Arm PMU events
-0x03, 0x17 and 0x2A around the timed walk, divided by the number of loads.
+0x03 (L1D refill), 0x17 (L2D refill) and 0xA2 (L3D refill on reads) around the
+timed walk, divided by the number of loads. 0xA2 is used instead of 0x2A because
+the C1-Nano opens 0x2A without error but it always reads 0 (Jesse, 2026-10-30).
 A level with about 1.0 refills per load is the one that missed. A `best` row
 per size carries the minimum.
 
@@ -111,8 +113,16 @@ both the bytes read and the bytes written.
   the scratchpad, starting at 0. Override with `--spm-dev`, `--spm-off`.
 - The pointer chase writes every byte of a buffer with aligned 8-byte stores
   before reading it (OCM ECC rule), and never calls memset or memcpy on OCM or SPM.
-- `DC CIVAC` from user space is allowed and keeps OCM data.
-- The PMU raw events 0x03, 0x17, 0x2A exist on the C1-Nano. If an event cannot be
+- `DC CIVAC` from user space is allowed and keeps OCM data. Every timed OCM pass,
+  repeats included, starts with a flush of the whole buffer, and every region gets
+  an untimed write and walk first, so 4 KiB page walks stay out of the timed passes.
+- SPM: the whole range is written (aligned 8-byte volatile stores) before any timed
+  pass, so the driver's per-page first-touch mapping is done. The mapping is
+  write-combining, so `str16` bandwidth measures merged bursts, not single stores.
+  The SPM phase runs last, because a wrong-size access would revoke the mapping and
+  later passes would get SIGBUS.
+- The PMU raw events 0x03, 0x17, 0xA2 count on the C1-Nano (0xA2 is wired in the PMU
+  RTL but missing from the kernel's named list, per Jesse). If an event cannot be
   opened the program prints `# perf: ... unavailable` and continues without counters.
 - `clock_gettime(CLOCK_MONOTONIC)` gives chip time at 1 ns resolution.
   Each program also prints `cntfrq_hz` from `CNTFRQ_EL0`.

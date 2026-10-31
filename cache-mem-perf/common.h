@@ -125,7 +125,7 @@ static inline void alloc_dram(struct buf *b, uint64_t bytes)
 
 static inline uint8_t *map_dev(const char *dev, uint64_t off, uint64_t bytes)
 {
-    int fd = open(dev, O_RDWR | O_SYNC);
+    int fd = open(dev, O_RDWR); /* MAP_SHARED below: the SPM driver refuses MAP_PRIVATE */
     if (fd < 0) {
         fprintf(stderr, "open %s: %s\n", dev, strerror(errno));
         exit(2);
@@ -221,7 +221,7 @@ struct perfgrp {
     int fd[PERF_N];
     int ok;
 };
-static const char *perf_name[PERF_N] = { "cycles", "l1d_refill", "l2d_refill", "l3d_refill" };
+static const char *perf_name[PERF_N] = { "cycles", "l1d_refill", "l2d_refill", "l3d_refill_rd" };
 
 static inline int perf_open_one(struct perf_event_attr *a, int group)
 {
@@ -245,8 +245,9 @@ static inline void perf_open(struct perfgrp *g)
         printf("# perf: unavailable (%s)\n", strerror(errno));
         return;
     }
-    /* Arm PMU architectural events: 0x03 L1D_CACHE_REFILL, 0x17 L2D_CACHE_REFILL, 0x2A L3D_CACHE_REFILL */
-    static const uint64_t raw[PERF_N] = { 0, 0x03, 0x17, 0x2A };
+    /* Arm PMU events: 0x03 L1D_CACHE_REFILL, 0x17 L2D_CACHE_REFILL, 0xA2 L3D_CACHE_REFILL_RD.
+     * Not 0x2A: the C1-Nano opens it without error but it always reads 0 (Jesse, 2026-10-30). */
+    static const uint64_t raw[PERF_N] = { 0, 0x03, 0x17, 0xA2 };
     for (int i = 1; i < PERF_N; i++) {
         memset(&a, 0, sizeof a);
         a.type = PERF_TYPE_RAW;

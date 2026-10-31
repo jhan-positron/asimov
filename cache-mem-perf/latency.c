@@ -190,7 +190,7 @@ int main(int argc, char **argv)
            cfg.cpu, mem_name(cfg.kind), (unsigned long long)read_cntfrq(), (unsigned long long)cfg.loads,
            cfg.reps, cfg.fresh, cfg.flush);
     printf("mem,size_bytes,mode,rep,loads,ns_per_load%s\n",
-           pg.ok ? ",cycles_per_load,l1d_refill_per_load,l2d_refill_per_load,l3d_refill_per_load" : "");
+           pg.ok ? ",cycles_per_load,l1d_refill_per_load,l2d_refill_per_load,l3d_refill_rd_per_load" : "");
     for (int i = 0; i < nsizes; i++)
         run_size(sizes[i]);
     return 0;
