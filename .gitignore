@@ -1,0 +1,4 @@
+cache-mem-perf/latency
+cache-mem-perf/bandwidth
+cache-mem-perf/results/
+*.o
