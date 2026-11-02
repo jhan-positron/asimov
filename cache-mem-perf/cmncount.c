@@ -28,9 +28,13 @@
  * The command always runs. If the PMU directory does not exist, or the node
  * list or an event name is bad, the command runs uncounted (or with the
  * remaining events) and a '# cmncount:' comment line in the output says so.
- * Every run, counted or not, also appends one row 'child_elapsed_ns' with the
- * command's lifetime from fork to exit on CLOCK_MONOTONIC (chip time, 1 ns
- * resolution), so the per-command cost is measured.
+ * Every run, counted or not, also appends two timing rows on CLOCK_MONOTONIC
+ * (chip time, 1 ns resolution): 'child_elapsed_ns', the command's lifetime from
+ * fork to exit, and 'helper_elapsed_ns', this program's own lifetime from the
+ * entry of main to just before exit, which also covers the sysfs reads, the
+ * counter open, enable, disable, read and close, and the output. The helper
+ * row minus the child row is the helper's in-process work; the exec and load
+ * of the helper before main are not measured.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -171,7 +175,7 @@ static int run_child(char **cmd)
     pid_t pid = fork();
     if (pid < 0) {
         perror("fork");
-        return 2;
+        return 2 << 8; /* an encoded wait status, like the waitpid failure below */
     }
     if (pid == 0) {
         execvp(cmd[0], cmd);
@@ -191,6 +195,15 @@ static int run_child(char **cmd)
     return status;
 }
 
+static double t_main; /* set at the entry of main */
+
+/* prints this program's own lifetime so far as a row; call after the counters are read */
+static void helper_row(void)
+{
+    double el = now_ns() - t_main;
+    fprintf(out, "%s,helper_elapsed_ns,-,%.0f,%.0f,%.0f,%.0f\n", label, el, el, el, el);
+}
+
 static int exit_code(int status)
 {
     if (WIFEXITED(status))
@@ -206,6 +219,7 @@ static int run_uncounted(char **cmd, const char *why, int dry)
     if (dry)
         return 0;
     int status = run_child(cmd);
+    helper_row();
     fflush(out);
     return exit_code(status);
 }
@@ -222,6 +236,7 @@ int main(int argc, char **argv)
 {
     const char *nodes = "", *events = "", *globals = "", *outpath = NULL;
     int dry = 0, i;
+    t_main = now_ns();
     for (i = 1; i < argc && strcmp(argv[i], "--"); i++) {
         int more = i + 1 < argc;
         if (!strcmp(argv[i], "--dry-run")) dry = 1;
@@ -374,6 +389,7 @@ int main(int argc, char **argv)
                 (unsigned long long)v[1], (unsigned long long)v[2], scaled);
         close(ev[k].fd);
     }
+    helper_row();
     fflush(out);
     return exit_code(status);
 }

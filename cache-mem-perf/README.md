@@ -116,7 +116,8 @@ command), `all.txt` with every command and its output in order, and `log.txt`.
 A counted command appears in `all.txt` and `log.txt` as `cmn <label> <command>`.
 Every command line in `log.txt` ends with the chip's `/proc/uptime` at launch, a
 coarse (10 ms) start stamp. The lifetime of every command run through
-`cmncount` is in `cmn-counts.csv` at 1 ns resolution.
+`cmncount`, and the lifetime of `cmncount` itself from the entry of its `main`
+to its exit, are in `cmn-counts.csv` at 1 ns resolution.
 Total size is a few tens of kilobytes.
 
 ## What each phase measures
@@ -128,7 +129,7 @@ Total size is a few tens of kilobytes.
 | A | DRAM latency, fresh chains | 512 KiB to 32 MiB | SLC step (to about 3.75 MiB), then DRAM |
 | A | DRAM latency, fresh chain + flush | 8 MiB | the DRAM reference (the flush removes the lines from the SLC too) |
 | B | OCM latency, fresh chain + flush, one region at a time, from CPUs 2, 4, 6, 8 | 256 KiB | per-region latency from each DSU, one-hop regions faster than three-hop regions; the counters show which home node each region is at |
-| B | control row per core: a 4 KiB DRAM chase on 4 KiB pages (`--no-thp`) under the counters; on CPU 2 once more without counters | 4 KiB | the per-node background of program load, kernel and output, to set against the OCM rows; the counted and uncounted pair gives the cost of the seven counters |
+| B | control row per core: a 4 KiB DRAM chase on 4 KiB pages (`--no-thp`) under the counters; on CPU 2 once more without counters | 4 KiB | the per-node background of program load, kernel and output, to set against the OCM rows; the `helper_elapsed_ns` rows of the counted and uncounted pair differ by the cost of the seven counters (setup, read, teardown and any effect on the command) |
 | B | OCM latency, all five regions, from CPUs 2, 4, 6, 8 | 1.25 MiB | OCM latency averaged over the five home nodes, per core |
 | B | SLC-regime fresh chase, 2 MiB DRAM-backed, from CPUs 4, 6, 8 | 2 MiB | the per-core SLC average, beside the all-five OCM row (CPU 2's is in the phase A sweep) |
 | D | one-core bandwidth read / write / copy | 16 KiB, 48 KiB, 96 KiB, 256 KiB, 2 MiB, 32 MiB | L1, L2, L3, SLC and DRAM bandwidth of one core |
@@ -176,11 +177,16 @@ both the bytes read and the bytes written.
 label,event,nodeid,count,enabled_ns,running_ns,scaled_count
 ocm-region1-cpu2,hns_pocq_reqs_recvd_all,160,20480,8123456,8123456,20480
 ocm-region1-cpu2,child_elapsed_ns,-,8130000,8130000,8130000,8130000
+ocm-region1-cpu2,helper_elapsed_ns,-,8410000,8410000,8410000,8410000
 ```
 
-One line per event per counted command, plus one `child_elapsed_ns` line with
-the command's lifetime from fork to exit on the chip's monotonic clock (the same
-value in the four numeric columns). `nodeid` is `-` for an event summed
+One line per event per counted command, plus two timing lines on the chip's
+monotonic clock (the same value in the four numeric columns): `child_elapsed_ns`,
+the command's lifetime from fork to exit, and `helper_elapsed_ns`, the lifetime
+of `cmncount` from the entry of its `main` to its exit, which includes the sysfs
+reads, the counter open, enable, disable, read and close, and the output. The
+difference of the two is the helper's own in-process work; the exec and load of
+`cmncount` before `main` are not timed. `nodeid` is `-` for an event summed
 over all nodes. The counts cover the whole command (buffer fill, chain build,
 warm-up, flushes and timed passes), so for an OCM row the question is which
 node's count rose, not the absolute number. Expected sizes (est.): a per-region
@@ -231,9 +237,13 @@ Run 1 took 1.237 s of chip time for 34 commands, about 14 ms of which per
 command was process start (est.). Run 2 has 63 commands, 47 of them under
 `cmncount`, which is one more program launch each, so about 110 launches and
 about 1.5 s of launch cost (est.) on top of the measurement work. The
-`child_elapsed_ns` rows measure each counted command's lifetime, and the CPU 2
-control runs counted and uncounted, which measures the counters' own cost; the
-helper's launch cost stays an estimate until the run's total is known. Run 2
+`child_elapsed_ns` rows measure each counted command's lifetime, the
+`helper_elapsed_ns` rows measure `cmncount`'s own lifetime around it, and the
+CPU 2 control runs counted and uncounted, so the difference of its two helper
+lifetimes is the counters' cost. The exec and load of `cmncount` before `main`,
+the 16 uncounted commands, the shell and the sysinfo collection are not timed;
+the run's total minus the summed helper lifetimes is unaccounted time, not a
+launch cost, and the launch cost stays an estimate. Run 2
 drops the 256 KiB to 3 MiB
 flushed DRAM rows, the unflushed OCM rows and the OCM write-then-flush rows
 (about 20 ms together). It adds 15 per-region and 3 all-five OCM latency rows

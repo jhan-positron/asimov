@@ -36,10 +36,14 @@
 # Chip-time estimate (est.): about 2 s. Run 1 measured 1.24 s for 34 commands;
 # process start was about 14 ms per command (est.), which dominates the small rows.
 # Run 2 has 63 commands, 47 of them under cmncount (one more program launch each),
-# so about 110 launches. cmncount records each counted command's lifetime in
-# cmn-counts.csv (chip ns), and the CPU 2 control runs counted and uncounted, so
-# the counter cost is measured; the helper's own launch stays an estimate. The
-# uptime stamp on each command line in log.txt is a coarse (10 ms) start time.
+# so about 110 launches. cmncount records each counted command's lifetime and its
+# own lifetime from main entry to exit in cmn-counts.csv (chip ns), and the CPU 2
+# control runs counted and uncounted, so the counters' cost (setup, read and
+# teardown, plus any effect on the command) is measured. The exec and load of
+# cmncount itself, the 16 uncounted commands, the shell and sysinfo are not timed;
+# the run's total minus the summed helper lifetimes is unaccounted time, not a
+# launch cost. The uptime stamp on each command line in log.txt is a coarse
+# (10 ms) start time.
 # Wall time at 2,779 s per chip second: about 1.5 h.
 
 set -u
@@ -88,13 +92,18 @@ run() {
 # cmn <label> <cmd...>: run cmd under the mesh counters. cmncount always runs
 # the command: with the PMU absent or an event name unknown it runs it uncounted
 # and writes one "# cmncount:" comment line to cmn-counts.csv. It also writes the
-# command's lifetime (fork to exit, chip ns) as a child_elapsed_ns row. Labels carry no comma.
+# command's lifetime (fork to exit, chip ns) as a child_elapsed_ns row and its own
+# lifetime (main entry to exit, which includes the counter setup, read and
+# teardown) as a helper_elapsed_ns row. Labels carry no comma.
 cmn() {
     l="$1"; shift
     "$CMN" --out "$CMNOUT" --label "$l" --nodes "$HNS" --events "$CMN_PER_NODE" --global "$CMN_GLOBAL" -- "$@"
 }
-# cmn0 <label> <cmd...>: the same without any counter, so a counted and an uncounted
-# run of one command give the cost of opening and reading the seven counters
+# cmn0 <label> <cmd...>: the same without any counter. The helper_elapsed_ns rows
+# of a counted and an uncounted run of one command differ by the cost of the seven
+# counters: open, enable, disable, read and close, plus any effect on the command
+# (visible in the child_elapsed_ns rows). The child rows alone do not hold the
+# counter setup and read, which happen outside the child's lifetime.
 cmn0() {
     l="$1"; shift
     "$CMN" --out "$CMNOUT" --label "$l" -- "$@"
