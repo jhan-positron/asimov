@@ -33,9 +33,11 @@
 #   - the OCM rows run from CPUs 2, 4, 6, 8 and under cmncount, which counts
 #     requests received at each of the five home nodes (ids from the address map).
 #
-# Chip-time estimate (est.): about 1.5 s. Run 1 measured 1.24 s for 34 commands;
-# run 2 has 55 commands, and process start was about 14 ms per command in run 1,
-# which dominates the small OCM rows. Wall time at 2,779 s per chip second: about 1.2 h.
+# Chip-time estimate (est.): about 2 s. Run 1 measured 1.24 s for 34 commands;
+# process start was about 14 ms per command (est.), which dominates the small rows.
+# Run 2 has 62 commands, 46 of them under cmncount (one more program launch each),
+# so about 108 launches. The uptime stamp on every command line in log.txt gives
+# the real per-command cost. Wall time at 2,779 s per chip second: about 1.5 h.
 
 set -u
 QUICK=0
@@ -74,7 +76,7 @@ say() { echo "$*" | tee -a "$LOG"; }
 # run <outfile> <cmd...>: echo the command, run it, append stdout to the file and to all.txt
 run() {
     f="$OUT/$1"; shift
-    say "+ $*"
+    say "+ $* [uptime $(cut -d' ' -f1 /proc/uptime 2>/dev/null)]"
     "$@" > "$OUT/.last" 2>> "$LOG" || say "  (exit $?)"
     cat "$OUT/.last" >> "$f"
     { echo "## $*"; cat "$OUT/.last"; } >> "$OUT/all.txt.tmp"
@@ -156,10 +158,16 @@ fi
 if [ "$HAVE_OCM" = 1 ]; then
     for c in $OCMCPUS; do
         say "## B. OCM latency (cpu $c)"
+        # control: the same program with a 4 KiB DRAM buffer, so the counters show the per-node
+        # background of program load, kernel and output; an OCM row's home node must rise well above it
+        run latency-control-cpu$c.csv cmn "control-cpu$c" "$LAT" --cpu $c --perf --sizes 4K --loads 8K --reps 1
         for r in 0 1 2 3 4; do
             run latency-ocm-region$r-cpu$c.csv cmn "ocm-region$r-cpu$c" "$LAT" --cpu $c --perf --mem ocm --ocm-regions $r --sizes 256K --fresh 3 --flush
         done
         run latency-ocm-all5-cpu$c.csv cmn "ocm-all5-cpu$c" "$LAT" --cpu $c --perf --mem ocm --ocm-regions 0,1,2,3,4 --sizes 1280K --fresh 3 --flush
+        # the SLC-regime fresh chase (DRAM-backed, 2 MiB) from the same core: the per-core SLC average,
+        # to set beside the all-five OCM row; CPU 2 already has it in latency-dram-large.csv
+        [ "$c" = "$CPU" ] || run latency-dram-slc-cpu$c.csv cmn "dram-slc-2M-cpu$c" "$LAT" --cpu $c --perf --fresh 3 --sizes 2M
     done
 fi
 
@@ -177,10 +185,10 @@ if [ "$HAVE_OCM" = 1 ]; then
     done
     run bandwidth-ocm-all5.csv cmn "ocm-read-all5" "$BW" --threads 1 --cpus $CPU --mem ocm --ocm-regions 0,1,2,3,4 --bytes 1280K --kernel read --flush-before --passes 1 --reps 3
     # streaming write into OCM over all five regions. One core's store rate is 32 GB/s at every DRAM
-    # footprint (run 1), so this row can only show whether OCM sinks one core's stores at that rate;
-    # the counters tell the path: about 9 x 4,096 x 5 requests per rep at the five nodes means
-    # full-line streaming writes, about twice that means fetch-then-write-back. Up to 384 KiB of
-    # each 10 MiB rep may still be dirty in the core at the end (under 4 %).
+    # footprint (run 1), so this row shows whether OCM sinks one core's stores at that rate, and the
+    # counters show how the requests spread over the five nodes. The request count cannot tell a data
+    # fetch from a dataless ownership request, so it says nothing about the write protocol. Up to
+    # 384 KiB of each 10 MiB rep may still be dirty in the core at the end (under 4 %).
     run bandwidth-ocm-write.csv cmn "ocm-write-all5" "$BW" --threads 1 --cpus $CPU --mem ocm --ocm-regions 0,1,2,3,4 --bytes 1280K --kernel write --flush-before --passes 8 --reps 3
 fi
 
@@ -199,10 +207,10 @@ for sp in 2M:4 16M:2; do
 done
 if [ "$QUICK" = 0 ]; then
     # writer placement on the mesh. Two writers: adjacent DSUs, end DSUs, the shared-L2 pair
-    # (2 x 32 GB/s stays under the 88 GB/s hemisphere write limit of run 1, so these show the
-    # per-DSU path). Four writers at the limit: one per DSU (run 1: 88 GB/s), two full DSUs
-    # side by side, two full DSUs at the ends; a placement that reads below 88 GB/s names a
-    # bottleneck in front of the home nodes.
+    # (2 x 32 GB/s stays under the hemisphere write limit of run 1, 86.8 GB/s at 16 MiB per writer,
+    # so these show the per-DSU path). Four writers at the limit: one per DSU (the control, same
+    # options as the other two rows), two full DSUs side by side, two full DSUs at the ends. A
+    # placement is different from the control only if the gap exceeds the spread of the repeats.
     for cp in 2,4 2,8 2,3 2,4,6,8 2,3,4,5 2,3,8,9; do
         n=$(echo "$cp" | tr ',' '-')
         t=$(echo "$cp" | tr ',' '\n' | wc -l)

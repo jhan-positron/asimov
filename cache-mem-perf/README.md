@@ -5,7 +5,7 @@ hemisphere of Asimov under asimov-os, the load-to-use latency and the streaming
 bandwidth of L1, L2, L3, the mesh cache (SLC), the CMN OCM regions and DRAM, and
 count the requests each mesh home node receives. Build with your usual flags,
 run `sh run_asimov.sh` as root, and send back the whole results directory. Chip
-time is about 1.5 s (est.), so about 1.2 h of wall time at 2,779 s per chip
+time is about 2 s (est.), so about 1.5 h of wall time at 2,779 s per chip
 second (run 1).
 
 Run 2 differs from run 1 (commit 9c6b8e7) in these places, all from the run 1
@@ -17,7 +17,9 @@ results:
   store-then-flush. The OCM copy row and the 4-core OCM write row are dropped.
   All three timed the DC CIVAC instruction (run 1 report, section 5a).
 - The OCM latency rows run from one core per DSU, and every OCM row runs under
-  the mesh counters.
+  the mesh counters, with one control row per core for the background counts.
+- The SLC-regime fresh chase (2 MiB, DRAM-backed) runs from CPUs 4, 6 and 8 as
+  well as CPU 2.
 - Writer placement rows with two and four writers.
 - The scratchpad phase stays in the script but is skipped while
   `/dev/asimov-spm` is absent.
@@ -112,6 +114,8 @@ The whole `results/<UTC time>/` directory. It holds `sysinfo.txt`, one CSV per
 test, `cmn-counts.csv` (the mesh counters, one line per event per counted
 command), `all.txt` with every command and its output in order, and `log.txt`.
 A counted command appears in `all.txt` and `log.txt` as `cmn <label> <command>`.
+Every command line in `log.txt` ends with the chip's `/proc/uptime` at launch, so
+the cost of each command, counted or not, can be read from the differences.
 Total size is a few tens of kilobytes.
 
 ## What each phase measures
@@ -123,14 +127,16 @@ Total size is a few tens of kilobytes.
 | A | DRAM latency, fresh chains | 512 KiB to 32 MiB | SLC step (to about 3.75 MiB), then DRAM |
 | A | DRAM latency, fresh chain + flush | 8 MiB | the DRAM reference (the flush removes the lines from the SLC too) |
 | B | OCM latency, fresh chain + flush, one region at a time, from CPUs 2, 4, 6, 8 | 256 KiB | per-region latency from each DSU, one-hop regions faster than three-hop regions; the counters show which home node each region is at |
+| B | control row per core: a 4 KiB DRAM chase under the counters | 4 KiB | the per-node background of program load, kernel and output, to subtract from the OCM rows |
 | B | OCM latency, all five regions, from CPUs 2, 4, 6, 8 | 1.25 MiB | OCM latency averaged over the five home nodes, per core |
+| B | SLC-regime fresh chase, 2 MiB DRAM-backed, from CPUs 4, 6, 8 | 2 MiB | the per-core SLC average, beside the all-five OCM row (CPU 2's is in the phase A sweep) |
 | D | one-core bandwidth read / write / copy | 16 KiB, 48 KiB, 96 KiB, 256 KiB, 2 MiB, 32 MiB | L1, L2, L3, SLC and DRAM bandwidth of one core |
 | D | one-core 2 MiB read under the counters | 2 MiB | how a DRAM buffer spreads over the five home nodes |
 | D | OCM read, flushed before | 256 KiB per region, 1.25 MiB all | read bandwidth from each home node and from all five |
-| D | OCM streaming write over all five regions | 1.25 MiB, 8 passes | whether OCM sinks one core's stores at the core's 32 GB/s store rate; the counters tell whether the lines are written whole or fetched first |
+| D | OCM streaming write over all five regions | 1.25 MiB, 8 passes | whether OCM sinks one core's stores at the core's 32 GB/s store rate, and how the requests spread over the five nodes (the request count cannot tell a data fetch from a dataless ownership request, so it says nothing about the write protocol) |
 | E | shared-L2 pair, CPUs 2 and 3 | 16 KiB, 48 KiB, 160 KiB each | whether two cores sharing L2 and L3 halve each other's bandwidth |
 | E | one core per DSU (2, 4, 6, 8) and all eight (2 to 9) | 2 MiB and 16 MiB per thread | aggregate SLC and DRAM bandwidth of the hemisphere |
-| E | writer placement: 2 writers on CPUs 2+4, 2+8, 2+3; 4 writers on 2+4+6+8, 2+3+4+5, 2+3+8+9 | 16 MiB each | whether the 88 GB/s write limit of run 1 depends on where the writers sit on the mesh |
+| E | writer placement: 2 writers on CPUs 2+4, 2+8, 2+3; 4 writers on 2+4+6+8 (the control), 2+3+4+5, 2+3+8+9 | 16 MiB each | whether the hemisphere write limit (run 1: 86.8 GB/s at 16 MiB per writer, 88.8 at 2 MiB) depends on where the writers sit; a placement differs from the control only if the gap exceeds the spread of the repeats |
 | E | OCM read from four cores | one region per core | aggregate OCM read |
 | C (runs last) | SPM latency and bandwidth | 64 KiB to 1 MiB | skipped while `/dev/asimov-spm` is absent |
 
@@ -176,11 +182,15 @@ warm-up, flushes and timed passes), so for an OCM row the question is which
 node's count rose, not the absolute number. Expected sizes (est.): a per-region
 row raises its home node by a few times 4,096 requests above the other four;
 the 2 MiB DRAM read row puts about 40,000 requests on each node if the buffer
-spreads evenly over the five. Five flat nodes under a region row would mean the
-node ids are wrong. `running_ns` below `enabled_ns` means the kernel
-multiplexed the counters and `scaled_count` is the estimate. A `# cmncount:`
-comment line records an event that could not be opened, or that the command
-ran uncounted because the PMU was absent or an event name was unknown.
+spreads evenly over the five. The control row of each core shows the background
+per node (program load, kernel, output); an OCM row's home node should exceed
+the other four by well over its own control value. Five nodes that look like the
+control under a region row would mean the node ids are wrong. `running_ns`
+below `enabled_ns` means the kernel multiplexed the counters and `scaled_count`
+is the estimate; a counter whose running time is zero gets a comment line, not
+a numeric row. A `# cmncount:` comment line also records an event that could not
+be opened or enabled, or that the command ran uncounted because the PMU was
+absent or an event name was unknown.
 
 ## Assumptions to check on the first boot
 
@@ -213,7 +223,11 @@ ran uncounted because the PMU was absent or an event name was unknown.
 ## Chip-time estimate (est.)
 
 Run 1 took 1.237 s of chip time for 34 commands, about 14 ms of which per
-command was process start. Run 2 has 55 commands. It drops the 256 KiB to 3 MiB
+command was process start (est.). Run 2 has 62 commands, 46 of them under
+`cmncount`, which is one more program launch each, so about 108 launches and
+about 1.5 s of launch cost (est.) on top of the measurement work. The uptime
+stamp on every command line in `log.txt` turns that estimate into a
+measurement. Run 2 drops the 256 KiB to 3 MiB
 flushed DRAM rows, the unflushed OCM rows and the OCM write-then-flush rows
 (about 20 ms together). It adds 15 per-region and 3 all-five OCM latency rows
 from CPUs 4, 6 and 8 (each builds 3 chains and walks 4 passes over 256 KiB or
@@ -221,4 +235,5 @@ from CPUs 4, 6 and 8 (each builds 3 chains and walks 4 passes over 256 KiB or
 start), the 2 MiB read row (about 1.5 ms), the OCM streaming write (3 reps of 8
 passes over 1.25 MiB, about 5 ms), six writer-placement rows (2 reps of 2 passes
 of 16 MiB per writer, about 5 ms each), and a 3-chain 8 MiB DRAM reference row
-(about 0.13 s). Total about 1.5 s (est.).
+(about 0.13 s), the four control rows and the three 2 MiB SLC chases (about 15 ms
+each). Total about 2 s (est.).

@@ -17,10 +17,13 @@
  * and the kernel reports enabled and running time; a line whose running time
  * is below its enabled time was multiplexed and is scaled.
  *
- * Counts cover the whole child process: buffer fill, chain build, warm-up,
- * flushes and timed passes together, plus the idle kernel on the other CPUs.
- * For the OCM rows every touch goes to the same home node, so the per-node
- * split is the point, not the absolute count.
+ * Counts cover the whole child process: program load, buffer fill, chain
+ * build, warm-up, flushes and timed passes together, plus the idle kernel on
+ * the other CPUs. For the OCM rows every buffer touch goes to the same home
+ * node, so the per-node split is the point, not the absolute count; a control
+ * row with a tiny DRAM buffer gives the background per node. A counter whose
+ * enable fails, or whose running time is zero, gets a comment line, never a
+ * numeric row.
  *
  * The command always runs. If the PMU directory does not exist, or the node
  * list or an event name is bad, the command runs uncounted (or with the
@@ -283,8 +286,11 @@ int main(int argc, char **argv)
         ev[k].err = ev[k].fd < 0 ? errno : 0;
     }
     for (int k = 0; k < n; k++)
-        if (ev[k].fd >= 0)
-            ioctl(ev[k].fd, PERF_EVENT_IOC_ENABLE, 0);
+        if (ev[k].fd >= 0 && ioctl(ev[k].fd, PERF_EVENT_IOC_ENABLE, 0) < 0) {
+            ev[k].err = errno;
+            close(ev[k].fd);
+            ev[k].fd = -1;
+        }
 
     pid_t pid = fork();
     if (pid < 0) {
@@ -327,7 +333,13 @@ int main(int argc, char **argv)
             fprintf(out, "# cmncount: %s nodeid %s read failed (%s)\n", ev[k].name, nid, strerror(errno));
             continue;
         }
-        double scaled = v[2] ? (double)v[0] * (double)v[1] / (double)v[2] : 0.0;
+        if (v[2] == 0) {
+            fprintf(out, "# cmncount: %s nodeid %s did not run (running_ns 0, enabled_ns %llu)\n", ev[k].name, nid,
+                    (unsigned long long)v[1]);
+            close(ev[k].fd);
+            continue;
+        }
+        double scaled = (double)v[0] * (double)v[1] / (double)v[2];
         fprintf(out, "%s,%s,%s,%llu,%llu,%llu,%.0f\n", label, ev[k].name, nid, (unsigned long long)v[0],
                 (unsigned long long)v[1], (unsigned long long)v[2], scaled);
         close(ev[k].fd);
