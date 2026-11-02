@@ -28,6 +28,9 @@
  * The command always runs. If the PMU directory does not exist, or the node
  * list or an event name is bad, the command runs uncounted (or with the
  * remaining events) and a '# cmncount:' comment line in the output says so.
+ * Every run, counted or not, also appends one row 'child_elapsed_ns' with the
+ * command's lifetime from fork to exit on CLOCK_MONOTONIC (chip time, 1 ns
+ * resolution), so the per-command cost is measured.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -41,6 +44,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #define MAX_EV 64
@@ -153,6 +157,47 @@ static int parse_list(const char *s, char out[][NAME_MAX_LEN], int max)
 static FILE *out;
 static const char *label = "-";
 
+static double now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1e9 + (double)ts.tv_nsec;
+}
+
+/* fork, exec, wait; prints the child's lifetime as a row; returns the exit status to use */
+static int run_child(char **cmd)
+{
+    double t0 = now_ns();
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        return 2;
+    }
+    if (pid == 0) {
+        execvp(cmd[0], cmd);
+        perror(cmd[0]);
+        _exit(127);
+    }
+    int status = 0;
+    pid_t w;
+    while ((w = waitpid(pid, &status, 0)) < 0 && errno == EINTR)
+        ;
+    if (w < 0) {
+        perror("waitpid");
+        status = 2 << 8; /* report failure, still print what the counters hold */
+    }
+    double el = now_ns() - t0;
+    fprintf(out, "%s,child_elapsed_ns,-,%.0f,%.0f,%.0f,%.0f\n", label, el, el, el, el);
+    return status;
+}
+
+static int exit_code(int status)
+{
+    if (WIFEXITED(status))
+        return WEXITSTATUS(status);
+    return 128 + (WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+}
+
 /* Run the command without counters, after one comment line that says why. */
 static int run_uncounted(char **cmd, const char *why, int dry)
 {
@@ -160,9 +205,9 @@ static int run_uncounted(char **cmd, const char *why, int dry)
     fflush(out);
     if (dry)
         return 0;
-    execvp(cmd[0], cmd);
-    perror(cmd[0]);
-    return 127;
+    int status = run_child(cmd);
+    fflush(out);
+    return exit_code(status);
 }
 
 static void usage(void)
@@ -249,6 +294,8 @@ int main(int argc, char **argv)
     if (read_text(path, text, sizeof text) >= 0)
         pmu_cpu = (int)strtol(text, NULL, 10); /* first cpu of "2" or "2-9" */
 
+    if (n == 0)
+        return run_uncounted(cmd, "no events requested, timing only", dry);
     int good = 0;
     for (int k = 0; k < n; k++) {
         ev[k].bad = build_event(&ev[k]) < 0;
@@ -292,24 +339,7 @@ int main(int argc, char **argv)
             ev[k].fd = -1;
         }
 
-    pid_t pid = fork();
-    if (pid < 0) {
-        perror("fork");
-        return 2;
-    }
-    if (pid == 0) {
-        execvp(cmd[0], cmd);
-        perror(cmd[0]);
-        _exit(127);
-    }
-    int status = 0;
-    pid_t w;
-    while ((w = waitpid(pid, &status, 0)) < 0 && errno == EINTR)
-        ;
-    if (w < 0) {
-        perror("waitpid");
-        status = 2 << 8; /* report failure, still print what the counters hold */
-    }
+    int status = run_child(cmd);
     for (int k = 0; k < n; k++)
         if (ev[k].fd >= 0)
             ioctl(ev[k].fd, PERF_EVENT_IOC_DISABLE, 0);
@@ -345,7 +375,5 @@ int main(int argc, char **argv)
         close(ev[k].fd);
     }
     fflush(out);
-    if (WIFEXITED(status))
-        return WEXITSTATUS(status);
-    return 128 + (WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+    return exit_code(status);
 }

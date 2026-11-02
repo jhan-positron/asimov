@@ -35,9 +35,12 @@
 #
 # Chip-time estimate (est.): about 2 s. Run 1 measured 1.24 s for 34 commands;
 # process start was about 14 ms per command (est.), which dominates the small rows.
-# Run 2 has 62 commands, 46 of them under cmncount (one more program launch each),
-# so about 108 launches. The uptime stamp on every command line in log.txt gives
-# the real per-command cost. Wall time at 2,779 s per chip second: about 1.5 h.
+# Run 2 has 63 commands, 47 of them under cmncount (one more program launch each),
+# so about 110 launches. cmncount records each counted command's lifetime in
+# cmn-counts.csv (chip ns), and the CPU 2 control runs counted and uncounted, so
+# the counter cost is measured; the helper's own launch stays an estimate. The
+# uptime stamp on each command line in log.txt is a coarse (10 ms) start time.
+# Wall time at 2,779 s per chip second: about 1.5 h.
 
 set -u
 QUICK=0
@@ -76,7 +79,7 @@ say() { echo "$*" | tee -a "$LOG"; }
 # run <outfile> <cmd...>: echo the command, run it, append stdout to the file and to all.txt
 run() {
     f="$OUT/$1"; shift
-    say "+ $* [uptime $(cut -d' ' -f1 /proc/uptime 2>/dev/null)]"
+    say "+ $* [uptime $(cut -d' ' -f1 /proc/uptime 2>/dev/null)]"  # coarse (10 ms) start stamp; command lifetimes are in cmn-counts.csv
     "$@" > "$OUT/.last" 2>> "$LOG" || say "  (exit $?)"
     cat "$OUT/.last" >> "$f"
     { echo "## $*"; cat "$OUT/.last"; } >> "$OUT/all.txt.tmp"
@@ -84,10 +87,17 @@ run() {
 }
 # cmn <label> <cmd...>: run cmd under the mesh counters. cmncount always runs
 # the command: with the PMU absent or an event name unknown it runs it uncounted
-# and writes one "# cmncount:" comment line to cmn-counts.csv. Labels carry no comma.
+# and writes one "# cmncount:" comment line to cmn-counts.csv. It also writes the
+# command's lifetime (fork to exit, chip ns) as a child_elapsed_ns row. Labels carry no comma.
 cmn() {
     l="$1"; shift
     "$CMN" --out "$CMNOUT" --label "$l" --nodes "$HNS" --events "$CMN_PER_NODE" --global "$CMN_GLOBAL" -- "$@"
+}
+# cmn0 <label> <cmd...>: the same without any counter, so a counted and an uncounted
+# run of one command give the cost of opening and reading the seven counters
+cmn0() {
+    l="$1"; shift
+    "$CMN" --out "$CMNOUT" --label "$l" -- "$@"
 }
 cpu_set_online() { # cpu 0|1
     [ -n "$OFFLINE_CPU" ] || return 0
@@ -158,9 +168,12 @@ fi
 if [ "$HAVE_OCM" = 1 ]; then
     for c in $OCMCPUS; do
         say "## B. OCM latency (cpu $c)"
-        # control: the same program with a 4 KiB DRAM buffer, so the counters show the per-node
-        # background of program load, kernel and output; an OCM row's home node must rise well above it
-        run latency-control-cpu$c.csv cmn "control-cpu$c" "$LAT" --cpu $c --perf --sizes 4K --loads 8K --reps 1
+        # control: the same program with a 4 KiB DRAM buffer on 4 KiB pages (--no-thp: no 2 MiB page is
+        # allocated or zeroed), so the counters show the per-node background of program load, kernel
+        # and output; an OCM row's home node must rise well above it. On CPU 2 the control also runs
+        # once without counters, which gives the cost of the seven counters themselves.
+        run latency-control-cpu$c.csv cmn "control-cpu$c" "$LAT" --cpu $c --perf --no-thp --sizes 4K --loads 8K --reps 1
+        [ "$c" = "$CPU" ] && run latency-control-cpu$c.csv cmn0 "control-nocount-cpu$c" "$LAT" --cpu $c --perf --no-thp --sizes 4K --loads 8K --reps 1
         for r in 0 1 2 3 4; do
             run latency-ocm-region$r-cpu$c.csv cmn "ocm-region$r-cpu$c" "$LAT" --cpu $c --perf --mem ocm --ocm-regions $r --sizes 256K --fresh 3 --flush
         done

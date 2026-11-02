@@ -50,7 +50,8 @@ static struct {
     const char *spm_dev;
     uint64_t spm_off;
     int no_hugetlb; /* skip MAP_HUGETLB, go straight to THP madvise */
-} memcfg = { "/dev/ocm", 0xE0000000ULL, 0x100000ULL, 0x40000ULL, "/dev/asimov-spm", 0, 0 };
+    int no_thp;     /* with no_hugetlb: ask for 4 KiB pages (MADV_NOHUGEPAGE), so only touched pages exist */
+} memcfg = { "/dev/ocm", 0xE0000000ULL, 0x100000ULL, 0x40000ULL, "/dev/asimov-spm", 0, 0, 0 };
 
 static inline double now_s(void)
 {
@@ -98,7 +99,9 @@ static inline void pin_cpu(int cpu)
 }
 
 /* DRAM: MAP_HUGETLB first (needs reserved 2 MiB pages), else THP madvise on
- * a 2 MiB-aligned anonymous mapping. Records which one was obtained. */
+ * a 2 MiB-aligned anonymous mapping, or 4 KiB pages with --no-thp (a control
+ * row then touches only its own bytes, not a whole 2 MiB page). Records which
+ * one was obtained. */
 static inline void alloc_dram(struct buf *b, uint64_t bytes)
 {
     size_t len = (bytes + HUGE_BYTES - 1) & ~(HUGE_BYTES - 1);
@@ -114,7 +117,10 @@ static inline void alloc_dram(struct buf *b, uint64_t bytes)
             exit(2);
         }
         p = (uint8_t *)(((uintptr_t)raw + HUGE_BYTES - 1) & ~(uintptr_t)(HUGE_BYTES - 1));
-        b->backing = madvise(p, len, MADV_HUGEPAGE) == 0 ? "thp" : "4k";
+        if (memcfg.no_thp)
+            b->backing = madvise(p, len, MADV_NOHUGEPAGE) == 0 ? "4k" : "4k?";
+        else
+            b->backing = madvise(p, len, MADV_HUGEPAGE) == 0 ? "thp" : "4k";
     }
     b->kind = MEM_DRAM;
     b->nseg = 1;
@@ -289,13 +295,14 @@ static inline void perf_stop(const struct perfgrp *g)
         ioctl(g->fd[0], PERF_EVENT_IOC_DISABLE, PERF_IOC_FLAG_GROUP);
 }
 
-/* Shared option parsing for --mem, --ocm-*, --spm-*, --no-hugetlb.
+/* Shared option parsing for --mem, --ocm-*, --spm-*, --no-hugetlb, --no-thp.
  * Returns the number of argv entries consumed (0 if not a memory option). */
 static inline int parse_mem_opt(int argc, char **argv, int i, enum mem_kind *kind, int *regions, int *nregions)
 {
     const char *a = argv[i];
     int more = i + 1 < argc;
     if (!strcmp(a, "--no-hugetlb")) { memcfg.no_hugetlb = 1; return 1; }
+    if (!strcmp(a, "--no-thp")) { memcfg.no_hugetlb = 1; memcfg.no_thp = 1; return 1; }
     if (!more) return 0;
     if (!strcmp(a, "--mem")) { *kind = parse_mem(argv[i + 1]); return 2; }
     if (!strcmp(a, "--ocm-dev")) { memcfg.ocm_dev = argv[i + 1]; return 2; }

@@ -148,7 +148,7 @@ static void usage(void)
 {
     fprintf(stderr,
             "usage: latency --sizes a,b,c [--cpu N] [--mem dram|ocm|spm] [--ocm-regions 0,1,..]\n"
-            "               [--loads N] [--reps R] [--fresh K] [--flush] [--perf] [--no-hugetlb]\n"
+            "               [--loads N] [--reps R] [--fresh K] [--flush] [--perf] [--no-hugetlb] [--no-thp]\n"
             "               [--ocm-dev P --ocm-base A --ocm-stride S --ocm-size B] [--spm-dev P --spm-off O]\n"
             "  sizes accept K/M/G suffixes. --mem ocm splits each size evenly over the listed regions.\n"
             "  --fresh K (2..8): K chains per line, time one pass over each of chains 1..K-1.\n"

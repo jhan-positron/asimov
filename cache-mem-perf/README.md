@@ -73,10 +73,10 @@ results:
 
 | File | What it is |
 |---|---|
-| `common.h` | buffers in DRAM (MAP_HUGETLB, else THP), OCM regions, SPM; flush; core perf counters |
+| `common.h` | buffers in DRAM (MAP_HUGETLB, else THP, or 4 KiB pages with `--no-thp`), OCM regions, SPM; flush; core perf counters |
 | `latency.c` | single-thread pointer chase; `--fresh`, `--flush`, `--perf` |
 | `bandwidth.c` | pinned threads, read / write / copy with `ldp`/`stp` q-register pairs; `ldr16`/`str16` for SPM |
-| `cmncount.c` | runs one command with mesh PMU events open (system-wide, on the PMU's CPU), appends one CSV line per event |
+| `cmncount.c` | runs one command with mesh PMU events open (system-wide, on the PMU's CPU), appends one CSV line per event and one with the command's lifetime |
 | `run_asimov.sh` | the whole plan, phases 0, A, B, D, E and C (last, skipped without `/dev/asimov-spm`); writes `results/<UTC time>/` |
 | `Makefile` | `make CC=<your aarch64 gcc>`; default flags `-O2 -mcpu=cortex-a520 -static` |
 
@@ -114,8 +114,9 @@ The whole `results/<UTC time>/` directory. It holds `sysinfo.txt`, one CSV per
 test, `cmn-counts.csv` (the mesh counters, one line per event per counted
 command), `all.txt` with every command and its output in order, and `log.txt`.
 A counted command appears in `all.txt` and `log.txt` as `cmn <label> <command>`.
-Every command line in `log.txt` ends with the chip's `/proc/uptime` at launch, so
-the cost of each command, counted or not, can be read from the differences.
+Every command line in `log.txt` ends with the chip's `/proc/uptime` at launch, a
+coarse (10 ms) start stamp. The lifetime of every command run through
+`cmncount` is in `cmn-counts.csv` at 1 ns resolution.
 Total size is a few tens of kilobytes.
 
 ## What each phase measures
@@ -127,7 +128,7 @@ Total size is a few tens of kilobytes.
 | A | DRAM latency, fresh chains | 512 KiB to 32 MiB | SLC step (to about 3.75 MiB), then DRAM |
 | A | DRAM latency, fresh chain + flush | 8 MiB | the DRAM reference (the flush removes the lines from the SLC too) |
 | B | OCM latency, fresh chain + flush, one region at a time, from CPUs 2, 4, 6, 8 | 256 KiB | per-region latency from each DSU, one-hop regions faster than three-hop regions; the counters show which home node each region is at |
-| B | control row per core: a 4 KiB DRAM chase under the counters | 4 KiB | the per-node background of program load, kernel and output, to subtract from the OCM rows |
+| B | control row per core: a 4 KiB DRAM chase on 4 KiB pages (`--no-thp`) under the counters; on CPU 2 once more without counters | 4 KiB | the per-node background of program load, kernel and output, to set against the OCM rows; the counted and uncounted pair gives the cost of the seven counters |
 | B | OCM latency, all five regions, from CPUs 2, 4, 6, 8 | 1.25 MiB | OCM latency averaged over the five home nodes, per core |
 | B | SLC-regime fresh chase, 2 MiB DRAM-backed, from CPUs 4, 6, 8 | 2 MiB | the per-core SLC average, beside the all-five OCM row (CPU 2's is in the phase A sweep) |
 | D | one-core bandwidth read / write / copy | 16 KiB, 48 KiB, 96 KiB, 256 KiB, 2 MiB, 32 MiB | L1, L2, L3, SLC and DRAM bandwidth of one core |
@@ -174,17 +175,21 @@ both the bytes read and the bytes written.
 ```
 label,event,nodeid,count,enabled_ns,running_ns,scaled_count
 ocm-region1-cpu2,hns_pocq_reqs_recvd_all,160,20480,8123456,8123456,20480
+ocm-region1-cpu2,child_elapsed_ns,-,8130000,8130000,8130000,8130000
 ```
 
-One line per event per counted command. `nodeid` is `-` for an event summed
+One line per event per counted command, plus one `child_elapsed_ns` line with
+the command's lifetime from fork to exit on the chip's monotonic clock (the same
+value in the four numeric columns). `nodeid` is `-` for an event summed
 over all nodes. The counts cover the whole command (buffer fill, chain build,
 warm-up, flushes and timed passes), so for an OCM row the question is which
 node's count rose, not the absolute number. Expected sizes (est.): a per-region
 row raises its home node by a few times 4,096 requests above the other four;
 the 2 MiB DRAM read row puts about 40,000 requests on each node if the buffer
-spreads evenly over the five. The control row of each core shows the background
-per node (program load, kernel, output); an OCM row's home node should exceed
-the other four by well over its own control value. Five nodes that look like the
+spreads evenly over the five. The control row of each core (a 4 KiB chase on 4 KiB
+pages, so no 2 MiB page is zeroed inside the count) shows the background per
+node (program load, kernel, output); an OCM row's home node should exceed the
+other four by well over its own control value. Five nodes that look like the
 control under a region row would mean the node ids are wrong. `running_ns`
 below `enabled_ns` means the kernel multiplexed the counters and `scaled_count`
 is the estimate; a counter whose running time is zero gets a comment line, not
@@ -223,11 +228,13 @@ absent or an event name was unknown.
 ## Chip-time estimate (est.)
 
 Run 1 took 1.237 s of chip time for 34 commands, about 14 ms of which per
-command was process start (est.). Run 2 has 62 commands, 46 of them under
-`cmncount`, which is one more program launch each, so about 108 launches and
-about 1.5 s of launch cost (est.) on top of the measurement work. The uptime
-stamp on every command line in `log.txt` turns that estimate into a
-measurement. Run 2 drops the 256 KiB to 3 MiB
+command was process start (est.). Run 2 has 63 commands, 47 of them under
+`cmncount`, which is one more program launch each, so about 110 launches and
+about 1.5 s of launch cost (est.) on top of the measurement work. The
+`child_elapsed_ns` rows measure each counted command's lifetime, and the CPU 2
+control runs counted and uncounted, which measures the counters' own cost; the
+helper's launch cost stays an estimate until the run's total is known. Run 2
+drops the 256 KiB to 3 MiB
 flushed DRAM rows, the unflushed OCM rows and the OCM write-then-flush rows
 (about 20 ms together). It adds 15 per-region and 3 all-five OCM latency rows
 from CPUs 4, 6 and 8 (each builds 3 chains and walks 4 passes over 256 KiB or
@@ -235,5 +242,5 @@ from CPUs 4, 6 and 8 (each builds 3 chains and walks 4 passes over 256 KiB or
 start), the 2 MiB read row (about 1.5 ms), the OCM streaming write (3 reps of 8
 passes over 1.25 MiB, about 5 ms), six writer-placement rows (2 reps of 2 passes
 of 16 MiB per writer, about 5 ms each), and a 3-chain 8 MiB DRAM reference row
-(about 0.13 s), the four control rows and the three 2 MiB SLC chases (about 15 ms
+(about 0.13 s), the five control rows and the three 2 MiB SLC chases (about 15 ms
 each). Total about 2 s (est.).

@@ -265,7 +265,7 @@ static void usage(void)
     fprintf(stderr,
             "usage: bandwidth [--threads T --cpus LIST] [--bytes B] [--kernel read|write|copy|all|ldr16|str16]\n"
             "                 [--passes P] [--reps R] [--mem dram|ocm|spm] [--ocm-regions 0,1,..]\n"
-            "                 [--flush-before] [--flush-after] [--no-hugetlb] [--ocm-*/--spm-* overrides]\n"
+            "                 [--flush-before] [--flush-after] [--no-hugetlb] [--no-thp] [--ocm-*/--spm-* overrides]\n"
             "  bytes is per thread and must be a multiple of 256; cpus: \"2,4,6\" or \"2-9\" or \"2-8:2\"\n");
     exit(2);
 }
