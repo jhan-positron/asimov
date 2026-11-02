@@ -183,10 +183,13 @@ ocm-region1-cpu2,helper_elapsed_ns,-,8410000,8410000,8410000,8410000
 One line per event per counted command, plus two timing lines on the chip's
 monotonic clock (the same value in the four numeric columns): `child_elapsed_ns`,
 the command's lifetime from fork to exit, and `helper_elapsed_ns`, the lifetime
-of `cmncount` from the entry of its `main` to its exit, which includes the sysfs
-reads, the counter open, enable, disable, read and close, and the output. The
-difference of the two is the helper's own in-process work; the exec and load of
-`cmncount` before `main` are not timed. `nodeid` is `-` for an event summed
+of `cmncount` from the entry of its `main` to the point where every preceding
+record is flushed to this file, which includes the sysfs reads, the counter
+open, enable, disable, read and close, and the output. Counted and uncounted
+runs flush at the same point, so the two are comparable; writing the
+`helper_elapsed_ns` line itself is outside the interval. The difference of the
+two rows is the helper's own in-process work; the exec and load of `cmncount`
+before `main` are not timed. `nodeid` is `-` for an event summed
 over all nodes. The counts cover the whole command (buffer fill, chain build,
 warm-up, flushes and timed passes), so for an OCM row the question is which
 node's count rose, not the absolute number. Expected sizes (est.): a per-region

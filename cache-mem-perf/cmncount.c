@@ -31,10 +31,12 @@
  * Every run, counted or not, also appends two timing rows on CLOCK_MONOTONIC
  * (chip time, 1 ns resolution): 'child_elapsed_ns', the command's lifetime from
  * fork to exit, and 'helper_elapsed_ns', this program's own lifetime from the
- * entry of main to just before exit, which also covers the sysfs reads, the
- * counter open, enable, disable, read and close, and the output. The helper
- * row minus the child row is the helper's in-process work; the exec and load
- * of the helper before main are not measured.
+ * entry of main to the point where every preceding record is flushed to the
+ * output file, which also covers the sysfs reads, the counter open, enable,
+ * disable, read and close, and the output. Counted and uncounted runs flush at
+ * the same point, just before the clock is read; writing the helper row itself
+ * is outside the interval. The helper row minus the child row is the helper's
+ * in-process work; the exec and load of the helper before main are not measured.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -197,9 +199,12 @@ static int run_child(char **cmd)
 
 static double t_main; /* set at the entry of main */
 
-/* prints this program's own lifetime so far as a row; call after the counters are read */
+/* prints this program's own lifetime as a row; call after the counters are read.
+ * Every preceding record is flushed before the clock is read, on every path, so
+ * counted and uncounted runs carry the same output work; the row itself is outside. */
 static void helper_row(void)
 {
+    fflush(out);
     double el = now_ns() - t_main;
     fprintf(out, "%s,helper_elapsed_ns,-,%.0f,%.0f,%.0f,%.0f\n", label, el, el, el, el);
 }
@@ -215,9 +220,10 @@ static int exit_code(int status)
 static int run_uncounted(char **cmd, const char *why, int dry)
 {
     fprintf(out, "# cmncount: %s, %s ran uncounted\n", why, label);
-    fflush(out);
-    if (dry)
+    if (dry) {
+        fflush(out);
         return 0;
+    }
     int status = run_child(cmd);
     helper_row();
     fflush(out);
