@@ -226,6 +226,11 @@ static inline uint64_t read_cntfrq(void)
 struct perfgrp {
     int fd[PERF_N];
     int ok;
+    const char *const *names; /* column names of the open set */
+    int ctl_err;              /* errno of the last failed reset/enable/disable ioctl, else 0 */
+    uint64_t t_enabled, t_running; /* ns, this row: the change since the previous read (the kernel keeps
+                                      the lifetime totals across PERF_EVENT_IOC_RESET, which resets counts only) */
+    uint64_t prev_enabled, prev_running; /* lifetime totals at the previous read, the baseline of the next row */
 };
 static const char *perf_name[PERF_N] = { "cycles", "l1d_refill", "l2d_refill", "l3d_refill_rd" };
 
@@ -235,32 +240,39 @@ static inline int perf_open_one(struct perf_event_attr *a, int group)
     a->disabled = group < 0;
     a->exclude_kernel = 1;
     a->exclude_hv = 1;
-    a->read_format = PERF_FORMAT_GROUP;
+    a->read_format = PERF_FORMAT_GROUP | PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING;
     return (int)syscall(__NR_perf_event_open, a, 0, -1, group, 0);
 }
 
-static inline void perf_open(struct perfgrp *g)
+/* The CME set: the same core PMU, with the C1-SME2 events that the core PMU
+ * exposes (asimov-bench dpa/stress counters.c and cme-perf open them this way).
+ * Numbers and names from the Arm C1-SME2 TRM 107831 chapter 12:
+ *   0x3246 CME_CYCLES              clock cycles of the CME (its own clock, not the timer)
+ *   0x327D CME_L1D_CACHE_REFILL_INNER  CME L1 refills whose data came from a cache inside the cluster (the DSU L3)
+ *   0x327E CME_L1D_CACHE_REFILL_OUTER  CME L1 refills whose data came from outside the cluster (SLC, OCM, DRAM)
+ * A load that hit the CME L1 counts in neither refill event. */
+static const char *perf_name_cme[PERF_N] = { "cycles", "cme_cycles", "cme_l1d_refill_inner", "cme_l1d_refill_outer" };
+
+static inline void perf_open_set(struct perfgrp *g, const uint64_t raw[PERF_N], const char *const names[PERF_N])
 {
     struct perf_event_attr a;
     memset(&a, 0, sizeof a);
     a.type = PERF_TYPE_HARDWARE;
     a.config = PERF_COUNT_HW_CPU_CYCLES;
-    g->ok = 0;
+    memset(g, 0, sizeof *g); /* fds, errno, coverage baseline: a stack-allocated group starts clean too */
+    g->names = names;
     g->fd[0] = perf_open_one(&a, -1);
     if (g->fd[0] < 0) {
         printf("# perf: unavailable (%s)\n", strerror(errno));
         return;
     }
-    /* Arm PMU events: 0x03 L1D_CACHE_REFILL, 0x17 L2D_CACHE_REFILL, 0xA2 L3D_CACHE_REFILL_RD.
-     * Not 0x2A: the C1-Nano opens it without error but it always reads 0 (Jesse, 2026-10-30). */
-    static const uint64_t raw[PERF_N] = { 0, 0x03, 0x17, 0xA2 };
     for (int i = 1; i < PERF_N; i++) {
         memset(&a, 0, sizeof a);
         a.type = PERF_TYPE_RAW;
         a.config = raw[i];
         g->fd[i] = perf_open_one(&a, g->fd[0]);
         if (g->fd[i] < 0) {
-            printf("# perf: event %s (raw 0x%llx) unavailable (%s)\n", perf_name[i],
+            printf("# perf: event %s (raw 0x%llx) unavailable (%s)\n", names[i],
                    (unsigned long long)raw[i], strerror(errno));
             return;
         }
@@ -268,31 +280,59 @@ static inline void perf_open(struct perfgrp *g)
     g->ok = 1;
 }
 
-static inline void perf_read(const struct perfgrp *g, uint64_t out[PERF_N])
+static inline void perf_open(struct perfgrp *g)
 {
-    uint64_t v[1 + PERF_N];
-    memset(out, 0, sizeof(uint64_t) * PERF_N);
-    if (!g->ok)
-        return;
-    if (read(g->fd[0], v, sizeof v) != (ssize_t)sizeof v) {
-        perror("perf read");
-        return;
-    }
-    memcpy(out, v + 1, sizeof(uint64_t) * PERF_N);
+    /* Arm PMU events: 0x03 L1D_CACHE_REFILL, 0x17 L2D_CACHE_REFILL, 0xA2 L3D_CACHE_REFILL_RD.
+     * Not 0x2A: the C1-Nano opens it without error but it always reads 0 (Jesse, 2026-10-30). */
+    static const uint64_t raw[PERF_N] = { 0, 0x03, 0x17, 0xA2 };
+    perf_open_set(g, raw, perf_name);
 }
 
-static inline void perf_start(const struct perfgrp *g)
+static inline void perf_open_cme(struct perfgrp *g)
+{
+    static const uint64_t raw[PERF_N] = { 0, 0x3246, 0x327D, 0x327E };
+    perf_open_set(g, raw, perf_name_cme);
+}
+
+/* Reads the group. Returns 1 when the counts are valid: the group is open,
+ * every ioctl since perf_start succeeded, the read returned the whole record
+ * and the group ran for the whole time it was enabled during this row (no
+ * multiplexing). Otherwise returns 0 with the reason in *why; the caller
+ * prints "-" columns. The enabled and running times the kernel returns are
+ * lifetime totals (IOC_RESET clears the counts, not the times), so the row's
+ * coverage is the change since the previous read; the baseline moves on every
+ * complete read, valid or not, so one multiplexed row does not taint the next. */
+static inline int perf_read(struct perfgrp *g, uint64_t out[PERF_N], const char **why)
+{
+    uint64_t v[3 + PERF_N]; /* nr, time_enabled, time_running, values */
+    memset(out, 0, sizeof(uint64_t) * PERF_N);
+    *why = NULL;
+    if (!g->ok) { *why = "group not open"; return 0; }
+    if (read(g->fd[0], v, sizeof v) != (ssize_t)sizeof v) { *why = "short read"; return 0; }
+    if (v[0] != PERF_N) { *why = "wrong event count"; return 0; }
+    g->t_enabled = v[1] - g->prev_enabled;
+    g->t_running = v[2] - g->prev_running;
+    g->prev_enabled = v[1];
+    g->prev_running = v[2];
+    memcpy(out, v + 3, sizeof(uint64_t) * PERF_N);
+    if (g->ctl_err) { *why = "counter ioctl failed"; return 0; }
+    if (g->t_running == 0 || g->t_running != g->t_enabled) { *why = "multiplexed"; return 0; } /* ran for part of the row */
+    return 1;
+}
+
+static inline void perf_start(struct perfgrp *g)
 {
     if (g->ok) {
-        ioctl(g->fd[0], PERF_EVENT_IOC_RESET, PERF_IOC_FLAG_GROUP);
-        ioctl(g->fd[0], PERF_EVENT_IOC_ENABLE, PERF_IOC_FLAG_GROUP);
+        g->ctl_err = 0;
+        if (ioctl(g->fd[0], PERF_EVENT_IOC_RESET, PERF_IOC_FLAG_GROUP) != 0) g->ctl_err = errno;
+        if (ioctl(g->fd[0], PERF_EVENT_IOC_ENABLE, PERF_IOC_FLAG_GROUP) != 0) g->ctl_err = errno;
     }
 }
 
-static inline void perf_stop(const struct perfgrp *g)
+static inline void perf_stop(struct perfgrp *g)
 {
-    if (g->ok)
-        ioctl(g->fd[0], PERF_EVENT_IOC_DISABLE, PERF_IOC_FLAG_GROUP);
+    if (g->ok && ioctl(g->fd[0], PERF_EVENT_IOC_DISABLE, PERF_IOC_FLAG_GROUP) != 0)
+        g->ctl_err = errno;
 }
 
 /* Shared option parsing for --mem, --ocm-*, --spm-*, --no-hugetlb, --no-thp.
@@ -343,5 +383,49 @@ static inline void alloc_buf(struct buf *b, enum mem_kind kind, uint64_t bytes, 
 static inline const char *mem_name(enum mem_kind k)
 {
     return k == MEM_DRAM ? "dram" : k == MEM_OCM ? "ocm" : "spm";
+}
+/* ---- CME (the Arm C1-SME2 unit): streaming-mode kernels in cme_kern.S ---- */
+#include <sys/auxv.h>
+#ifndef HWCAP2_SME
+#define HWCAP2_SME (1UL << 23)
+#endif
+#ifndef HWCAP2_SME2
+#define HWCAP2_SME2 (1UL << 37)
+#endif
+#if defined(__aarch64__)
+uint64_t cme_svl(void);
+uint64_t cme_chase(uint64_t p, uint64_t hops);
+uint64_t cme_roundtrip(uint64_t x, uint64_t n);
+uint64_t cme_read4(const void *p, uint64_t bytes);
+void cme_write4(void *p, uint64_t bytes, uint64_t v);
+void cme_copy4(void *d, const void *s, uint64_t bytes);
+uint64_t cme_read1(const void *p, uint64_t bytes);
+void cme_write1(void *p, uint64_t bytes, uint64_t v);
+#else
+/* Stand-ins so the harness builds on a non-Arm host; --cme refuses to run there. */
+static inline uint64_t cme_svl(void) { return 0; }
+static inline uint64_t cme_chase(uint64_t p, uint64_t hops) { (void)hops; return p; }
+static inline uint64_t cme_roundtrip(uint64_t x, uint64_t n) { (void)n; return x; }
+static inline uint64_t cme_read4(const void *p, uint64_t bytes) { (void)p; (void)bytes; return 0; }
+static inline void cme_write4(void *p, uint64_t bytes, uint64_t v) { (void)p; (void)bytes; (void)v; }
+static inline void cme_copy4(void *d, const void *s, uint64_t bytes) { (void)d; (void)s; (void)bytes; }
+static inline uint64_t cme_read1(const void *p, uint64_t bytes) { (void)p; (void)bytes; return 0; }
+static inline void cme_write1(void *p, uint64_t bytes, uint64_t v) { (void)p; (void)bytes; (void)v; }
+#endif
+
+/* Exit unless this CPU has SME2 and the streaming vector length is 64 B (the
+ * Asimov CME). Prints the reason: the row then says why it is missing. */
+static inline void require_cme(void)
+{
+    unsigned long hw2 = getauxval(AT_HWCAP2);
+    if (!(hw2 & HWCAP2_SME) || !(hw2 & HWCAP2_SME2)) {
+        printf("# cme: SME2 not supported on this CPU (hwcap2 0x%lx)\n", hw2);
+        exit(2);
+    }
+    uint64_t svl = cme_svl();
+    if (svl != 64) {
+        printf("# cme: streaming vector length is %llu B, the kernels assume 64\n", (unsigned long long)svl);
+        exit(2);
+    }
 }
 #endif

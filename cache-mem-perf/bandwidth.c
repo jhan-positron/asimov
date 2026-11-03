@@ -15,6 +15,10 @@
  *   from the home node (OCM / SLC), not from L1/L2/L3.
  * --flush-after: DC CIVAC inside the timed region after the passes, so a
  *   write test includes the write-back to the home node ("write+writeback").
+ * --cme: the same passes through the CME in streaming mode (cme_kern.S):
+ *   read / write / copy become LD1B and ST1B of four vectors (256 B per
+ *   instruction), ldr16 / str16 become single-vector LD1B / ST1B (64 B).
+ *   Kernel names in the CSV get a "cme-" prefix; bytes must be a multiple of 1024.
  */
 #include "common.h"
 #include <pthread.h>
@@ -29,7 +33,7 @@ static struct {
     int threads, ncpus, cpus[MAX_CPUS];
     uint64_t bytes;
     int run[K_COUNT];
-    int passes, reps, flush_before, flush_after;
+    int passes, reps, flush_before, flush_after, cme;
     enum mem_kind kind;
     int regions[MAX_SEGS], nregions;
 } cfg = { .threads = 1, .bytes = 1 << 20, .passes = 4, .reps = 3, .kind = MEM_DRAM };
@@ -171,12 +175,25 @@ static void k_ldr16(const uint8_t *p, uint64_t bytes) { k_read(p, bytes); }
 static void k_str16(uint8_t *p, uint64_t bytes, uint64_t v) { k_write(p, bytes, v); }
 #endif
 
+static volatile uint64_t cme_fold; /* XOR of the CME read kernels' folds; keeps nothing, printed nowhere */
+
 /* One pass over all segments of the thread's buffer(s); returns bytes moved. */
 static uint64_t pass(enum kernel k, struct thread *t, uint64_t v)
 {
     for (int s = 0; s < t->a.nseg; s++) {
         uint8_t *a = t->a.seg[s].base;
         uint64_t n = t->a.seg[s].bytes;
+        if (cfg.cme) {
+            switch (k) {
+            case K_READ: cme_fold ^= cme_read4(a, n); break;
+            case K_WRITE: cme_write4(a, n, v); break;
+            case K_COPY: cme_copy4(t->b.seg[s].base, a, n); break;
+            case K_LDR16: cme_fold ^= cme_read1(a, n); break;
+            case K_STR16: cme_write1(a, n, v); break;
+            default: break;
+            }
+            continue;
+        }
         switch (k) {
         case K_READ: k_read(a, n); break;
         case K_WRITE: k_write(a, n, v); break;
@@ -234,6 +251,8 @@ static void *worker(void *arg)
     uint64_t v = ((uint64_t)getpid() + (uint64_t)t->idx + 1) * 0x9E3779B97F4A7C15ULL;
     if (cfg.ncpus)
         pin_cpu(t->cpu);
+    if (cfg.cme)
+        require_cme();
     alloc_thread_bufs(t);
     pthread_barrier_wait(&bar); /* all buffers exist before anyone starts timing */
 
@@ -265,8 +284,9 @@ static void usage(void)
     fprintf(stderr,
             "usage: bandwidth [--threads T --cpus LIST] [--bytes B] [--kernel read|write|copy|all|ldr16|str16]\n"
             "                 [--passes P] [--reps R] [--mem dram|ocm|spm] [--ocm-regions 0,1,..]\n"
-            "                 [--flush-before] [--flush-after] [--no-hugetlb] [--no-thp] [--ocm-*/--spm-* overrides]\n"
-            "  bytes is per thread and must be a multiple of 256; cpus: \"2,4,6\" or \"2-9\" or \"2-8:2\"\n");
+            "                 [--flush-before] [--flush-after] [--cme] [--no-hugetlb] [--no-thp] [--ocm-*/--spm-* overrides]\n"
+            "  bytes is per thread and must be a multiple of 256 (1024 with --cme); cpus: \"2,4,6\" or \"2-9\" or \"2-8:2\"\n"
+            "  --cme: run the kernels through the CME in streaming mode (needs SME2, SVL 64 B)\n");
     exit(2);
 }
 
@@ -281,6 +301,7 @@ int main(int argc, char **argv)
         int more = i + 1 < argc;
         if (!strcmp(a, "--flush-before")) cfg.flush_before = 1;
         else if (!strcmp(a, "--flush-after")) cfg.flush_after = 1;
+        else if (!strcmp(a, "--cme")) cfg.cme = 1;
         else if (!strcmp(a, "--threads") && more) { cfg.threads = atoi(argv[++i]); threads_given = 1; }
         else if (!strcmp(a, "--cpus") && more) parse_cpus(argv[++i]);
         else if (!strcmp(a, "--bytes") && more) cfg.bytes = parse_bytes(argv[++i]);
@@ -301,7 +322,7 @@ int main(int argc, char **argv)
     }
     if (threads_given && cfg.ncpus == 0) { fprintf(stderr, "--threads requires --cpus\n"); usage(); }
     if (cfg.threads < 1 || cfg.threads > MAX_CPUS || cfg.reps < 1 || cfg.reps > MAX_REPS || cfg.passes < 1 ||
-        cfg.bytes == 0 || cfg.bytes % 256 != 0)
+        cfg.bytes == 0 || cfg.bytes % 256 != 0 || (cfg.cme && cfg.bytes % 1024 != 0))
         usage();
     if (cfg.ncpus && cfg.threads > cfg.ncpus)
         fprintf(stderr, "warning: %d threads on %d cpus\n", cfg.threads, cfg.ncpus);
@@ -311,9 +332,9 @@ int main(int argc, char **argv)
     struct thread *th = calloc((size_t)cfg.threads, sizeof *th);
     if (!th || pthread_barrier_init(&bar, NULL, (unsigned)cfg.threads + 1) != 0) { perror("setup"); return 2; }
     printf("# bandwidth: GB = 1e9 bytes; asm_kernels=%d threads=%d bytes_per_thread=%llu passes=%d reps=%d mem=%s "
-           "flush_before=%d flush_after=%d cntfrq_hz=%llu\n", HAVE_ASM, cfg.threads,
+           "flush_before=%d flush_after=%d cme=%d cntfrq_hz=%llu\n", HAVE_ASM, cfg.threads,
            (unsigned long long)cfg.bytes, cfg.passes, cfg.reps, mem_name(cfg.kind), cfg.flush_before,
-           cfg.flush_after, (unsigned long long)read_cntfrq());
+           cfg.flush_after, cfg.cme, (unsigned long long)read_cntfrq());
     for (int i = 0; i < cfg.threads; i++) {
         th[i].idx = i;
         th[i].cpu = cfg.ncpus ? cfg.cpus[i % cfg.ncpus] : -1;
@@ -340,10 +361,10 @@ int main(int argc, char **argv)
             }
             double agg = (double)total / longest / 1e9;
             if (agg > best) best = agg;
-            printf("%s,%s,%d,%llu,%d,%llu,%.6f,%.3f,%.3f,%.3f\n", mem_name(cfg.kind), kernel_name[k], cfg.threads,
+            printf("%s,%s%s,%d,%llu,%d,%llu,%.6f,%.3f,%.3f,%.3f\n", mem_name(cfg.kind), cfg.cme ? "cme-" : "", kernel_name[k], cfg.threads,
                    (unsigned long long)cfg.bytes, rep, (unsigned long long)total, longest, agg, mn, mx);
         }
-        printf("%s,%s,%d,%llu,best,-,-,%.3f,-,-\n", mem_name(cfg.kind), kernel_name[k], cfg.threads,
+        printf("%s,%s%s,%d,%llu,best,-,-,%.3f,-,-\n", mem_name(cfg.kind), cfg.cme ? "cme-" : "", kernel_name[k], cfg.threads,
                (unsigned long long)cfg.bytes, best);
         fflush(stdout);
     }

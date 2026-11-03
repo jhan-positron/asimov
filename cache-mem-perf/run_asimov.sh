@@ -2,8 +2,8 @@
 # run_asimov.sh - the whole Asimov cache measurement, one run (run 2 form).
 #
 # Runs as root under asimov-os. POSIX sh (busybox ash is enough).
-# Usage: sh run_asimov.sh [--quick] [--out DIR]
-#   --quick  host self-test: small DRAM-only subset, no CPU hot-plug, no devices
+# Usage: sh run_asimov.sh [--quick] [--dry-run] [--out DIR]   (options in lib_run.sh)
+# The CME test is run_cme.sh; run_all.sh runs both into one results directory.
 #
 # Phases (CPU numbers from Jesse's 2026-10-30 notes: kernel on 0-1, test on 2):
 #   0  sysinfo         cache topology, kernel config, timer, memory map, mesh map, mesh PMU
@@ -24,6 +24,11 @@
 #   - every flushed latency row is "--fresh 3 --flush": a chain that was never
 #     walked, flushed before its one timed pass. Run 1's "--flush --reps 3"
 #     re-walked a learned chain and 9 to 23 % of its lines were prefetched.
+#   - (after run 2) the OCM chase rows are "--sparse --fresh 8 --flush": one member
+#     line per 4 KiB page per chain. Run 2's dense 256 KiB rows still counted 1.1143 to
+#     1.4468 L2 refills and 0.7627 to 0.9500 L3 refills per load (40 passes); a fresh chain
+#     changes the walk order, not the set of lines, so prefetched neighbours were still
+#     members. The sparse chain is an experimental mitigation; its dense twin is the control.
 #   - the flushed DRAM rows shrink to 8 MiB: DC CIVAC removes DRAM-backed lines
 #     from the SLC too, so those rows measure DRAM (52.7 ns in run 1).
 #   - the OCM write rows with --flush-after are gone: they timed the DC CIVAC
@@ -44,81 +49,20 @@
 # the run's total minus the summed helper lifetimes is unaccounted time, not a
 # launch cost. The uptime stamp on each command line in log.txt is a coarse
 # (10 ms) start time.
-# Wall time at 2,779 s per chip second: about 1.5 h.
+# Phase F adds 33 commands, 48 launches and about 1.3 s (est.): the CME chase pays about 22 ns
+# per hop even from its L1 (asimov-bench, 2026-10-22), ten times the core's 2 ns, so its chase
+# rows cost ten times A's, and half of its estimate is the launch allowance. It lives in
+# run_cme.sh. The whole run: `sh run_all.sh --dry-run | python3 est_chip_time.py`, about 4.1 s
+# (est.), about 3 h of wall time at 2,779 s per chip second; this script alone about 2.8 s
+# (est.). The launch allowance is not measured by anything in the run.
 
-set -u
-QUICK=0
-OUT=""
-while [ $# -gt 0 ]; do
-    case "$1" in
-    --quick) QUICK=1 ;;
-    --out) shift; OUT="$1" ;;
-    *) echo "unknown option: $1" >&2; exit 2 ;;
-    esac
-    shift
-done
 HERE=$(cd "$(dirname "$0")" && pwd)
-[ -n "$OUT" ] || OUT="$HERE/results/$(date -u +%Y%m%dT%H%M%SZ)"
-mkdir -p "$OUT"
-LOG="$OUT/log.txt"
-LAT="$HERE/latency"
-BW="$HERE/bandwidth"
-CMN="$HERE/cmncount"
-CMNOUT="$OUT/cmn-counts.csv"
-[ -x "$LAT" ] && [ -x "$BW" ] && [ -x "$CMN" ] || { echo "build first: make" >&2; exit 2; }
-
-# Home-node ids of OCM0..4 (asimov-address-map profiles/sam_map.yaml: HNS_CTRL, HNS_X2..X5).
-HNS="88,160,216,288,344"
-# Mesh events: requests received per home node, plus two sums over all nodes.
-CMN_PER_NODE="hns_pocq_reqs_recvd_all"
-CMN_GLOBAL="hns_mc_reqs_local_all,hns_cache_miss_all"
-
-if [ "$QUICK" = 1 ]; then
-    CPU=3; PAIR="3,5"; PERDSU="3,5"; ALL="3,5"; OFFLINE_CPU=""; OCMCPUS="3"
-else
-    CPU=2; PAIR="2,3"; PERDSU="2,4,6,8"; ALL="2-9"; OFFLINE_CPU=3; OCMCPUS="2 4 6 8"
-fi
-
-say() { echo "$*" | tee -a "$LOG"; }
-# run <outfile> <cmd...>: echo the command, run it, append stdout to the file and to all.txt
-run() {
-    f="$OUT/$1"; shift
-    say "+ $* [uptime $(cut -d' ' -f1 /proc/uptime 2>/dev/null)]"  # coarse (10 ms) start stamp; command lifetimes are in cmn-counts.csv
-    "$@" > "$OUT/.last" 2>> "$LOG" || say "  (exit $?)"
-    cat "$OUT/.last" >> "$f"
-    { echo "## $*"; cat "$OUT/.last"; } >> "$OUT/all.txt.tmp"
-    rm -f "$OUT/.last"
-}
-# cmn <label> <cmd...>: run cmd under the mesh counters. cmncount always runs
-# the command: with the PMU absent or an event name unknown it runs it uncounted
-# and writes one "# cmncount:" comment line to cmn-counts.csv. It also writes the
-# command's lifetime (fork to exit, chip ns) as a child_elapsed_ns row and its own
-# lifetime (main entry to exit, which includes the counter setup, read and
-# teardown) as a helper_elapsed_ns row. Labels carry no comma.
-cmn() {
-    l="$1"; shift
-    "$CMN" --out "$CMNOUT" --label "$l" --nodes "$HNS" --events "$CMN_PER_NODE" --global "$CMN_GLOBAL" -- "$@"
-}
-# cmn0 <label> <cmd...>: the same without any counter. The helper_elapsed_ns rows
-# of a counted and an uncounted run of one command differ by the cost of the seven
-# counters: open, enable, disable, read and close, plus any effect on the command
-# (visible in the child_elapsed_ns rows). The child rows alone do not hold the
-# counter setup and read, which happen outside the child's lifetime.
-cmn0() {
-    l="$1"; shift
-    "$CMN" --out "$CMNOUT" --label "$l" -- "$@"
-}
-cpu_set_online() { # cpu 0|1
-    [ -n "$OFFLINE_CPU" ] || return 0
-    f="/sys/devices/system/cpu/cpu$1/online"
-    [ -w "$f" ] || { say "no $f, skipping hot-plug"; return 0; }
-    echo "$2" > "$f" && say "cpu$1 online=$2" || say "cpu$1: hot-plug failed"
-}
+. "$HERE/lib_run.sh"
 
 say "# run_asimov.sh start $(date -u +%FT%TZ) quick=$QUICK out=$OUT"
 
 # ---- 0. sysinfo ----
-{
+[ "$DRY" = 1 ] || {
     echo "## date"; date -u
     echo "## uname"; uname -a
     echo "## cmdline"; cat /proc/cmdline 2>/dev/null
@@ -153,9 +97,7 @@ say "# run_asimov.sh start $(date -u +%FT%TZ) quick=$QUICK out=$OUT"
 } > "$OUT/sysinfo.txt" 2>&1
 say "sysinfo written"
 
-HAVE_OCM=0; HAVE_SPM=0
-[ "$QUICK" = 1 ] || { [ -e /dev/ocm ] && HAVE_OCM=1; [ -e /dev/asimov-spm ] && HAVE_SPM=1; }
-say "ocm=$HAVE_OCM spm=$HAVE_SPM hugepages_free=$(grep HugePages_Free /proc/meminfo | awk '{print $2}')"
+say "ocm=$HAVE_OCM spm=$HAVE_SPM sme2=$HAVE_SME2 hugepages_free=$(grep HugePages_Free /proc/meminfo | awk '{print $2}')"
 
 cpu_set_online "$OFFLINE_CPU" 0
 
@@ -183,10 +125,16 @@ if [ "$HAVE_OCM" = 1 ]; then
         # once without counters, which gives the cost of the seven counters themselves.
         run latency-control-cpu$c.csv cmn "control-cpu$c" "$LAT" --cpu $c --perf --no-thp --sizes 4K --loads 8K --reps 1
         [ "$c" = "$CPU" ] && run latency-control-cpu$c.csv cmn0 "control-nocount-cpu$c" "$LAT" --cpu $c --perf --no-thp --sizes 4K --loads 8K --reps 1
+        # sparse chains (one member line per 4 KiB page per chain, seven timed passes of 64 hops):
+        # run 2's dense 256 KiB rows counted 1.1143 to 1.4468 L2 refills and 0.7627 to 0.9500 L3
+        # refills per load over 40 passes (the reading: prefetched neighbours found later by the
+        # chain, a hypothesis). The dense all-five row (1.0003 to 1.0011 of each in run 2) stays as
+        # the control beside the sparse all-five row.
         for r in 0 1 2 3 4; do
-            run latency-ocm-region$r-cpu$c.csv cmn "ocm-region$r-cpu$c" "$LAT" --cpu $c --perf --mem ocm --ocm-regions $r --sizes 256K --fresh 3 --flush
+            run latency-ocm-region$r-cpu$c.csv cmn "ocm-region$r-cpu$c" "$LAT" --cpu $c --perf --mem ocm --ocm-regions $r --sizes 256K --sparse --fresh 8 --flush
         done
-        run latency-ocm-all5-cpu$c.csv cmn "ocm-all5-cpu$c" "$LAT" --cpu $c --perf --mem ocm --ocm-regions 0,1,2,3,4 --sizes 1280K --fresh 3 --flush
+        run latency-ocm-all5-cpu$c.csv cmn "ocm-all5-cpu$c" "$LAT" --cpu $c --perf --mem ocm --ocm-regions 0,1,2,3,4 --sizes 1280K --sparse --fresh 8 --flush
+        run latency-ocm-all5-dense-cpu$c.csv cmn "ocm-all5-dense-cpu$c" "$LAT" --cpu $c --perf --mem ocm --ocm-regions 0,1,2,3,4 --sizes 1280K --fresh 3 --flush
         # the SLC-regime fresh chase (DRAM-backed, 2 MiB) from the same core: the per-core SLC average,
         # to set beside the all-five OCM row; CPU 2 already has it in latency-dram-large.csv
         [ "$c" = "$CPU" ] || run latency-dram-slc-cpu$c.csv cmn "dram-slc-2M-cpu$c" "$LAT" --cpu $c --perf --fresh 3 --sizes 2M
@@ -251,6 +199,5 @@ if [ "$HAVE_SPM" = 1 ]; then
     run bandwidth-spm.csv "$BW" --threads 1 --cpus $CPU --mem spm --bytes 1M --kernel str16 --passes 2 --reps 3
 fi
 
-mv "$OUT/all.txt.tmp" "$OUT/all.txt" 2>/dev/null
-say "# run_asimov.sh done $(date -u +%FT%TZ)"
-say "# send back the whole directory: $OUT"
+[ "$DRY" = 1 ] && exit 0
+finish_suite run_asimov.sh
