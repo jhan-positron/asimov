@@ -139,7 +139,7 @@ results:
 | `cmncount.c` | runs one command with mesh PMU events open (system-wide, on the PMU's CPU), appends one CSV line per event and one with the command's lifetime |
 | `cme_kern.S` | the chase and the read / write / copy loops again as streaming-mode SVE (`LD1D` + `LASTB`; `LD1B` / `ST1B` of four vectors and of one), used by `latency --cme` and `bandwidth --cme`; plus the register round trip and `RDSVL` |
 | `cme_test.c` | self-test of those kernels on any SME2 machine: chase, round trip, read fold, write pattern, copy; `make cme_test && ./cme_test` |
-| `run_followup.sh` | the run 3 follow-up (follow-up-run-plan.md): the OCM chase rows dense, sparse and vary from CPUs 2 and 8, the TLB counter set on the CPU 2 rows with its own validation row, the CME latency sweep, and a sequential chain as the prefetch stimulus, all with the prefetch-refill counters, plus the small one-core write rows with run 3's and run 2's bandwidth programs (G5) and the 20 dense OCM cells under the crosspoint flit counters (G6), the 64 KiB to 512 KiB chase rows with the L2 and L3 hit set (G1, run 5) and the one-core read rows with software prefetch distances and two streams under the prefetch counters (G7, run 5); meant to run once per boot (normal, prefetchers off, larger OCM pages, both) |
+| `run_followup.sh` | the run 3 follow-up (follow-up-run-plan.md): the OCM chase rows dense, sparse and vary from CPUs 2 and 8, the TLB and walk counter sets on the CPU 2 rows, each with its own validation row, the CME latency sweep, and a sequential chain as the prefetch stimulus, all with the prefetch-refill counters, plus the small one-core write rows with run 3's and run 2's bandwidth programs (G5) and the 20 dense OCM cells under the crosspoint flit counters (G6), the 64 KiB to 512 KiB chase rows with the L2 and L3 hit set (G1, run 5) and the one-core read rows with software prefetch distances and two streams under the prefetch counters (G7, run 5); meant to run once per boot (normal, prefetchers off, larger OCM pages, both) |
 | `test_lat_rows.py` | test of the latency CSV reader in gen_run3.py over run 2, run 3 and run 4 row shapes, refused and invalid counters; `python3 test_lat_rows.py` |
 | `perf_cov_test.c` | host test that a multiplexed counter row is rejected and the next row is not; `make perf_cov_test && taskset -c 2 ./perf_cov_test` on an Arm machine |
 | `est_chip_time.py` | sizes a run from `sh run_asimov.sh --dry-run`: exact counts per command, labelled time assumptions |
@@ -269,13 +269,18 @@ IMP_L2D_CACHE_REFILL_L1DHWPRF (the L1D prefetcher's requests). Each is its own
 rate; the L2 column minus the two L2 prefetch columns is "L2 refills not
 accounted for by these events", not a demand count. `--events tlb` swaps the
 three prefetch events for 0x05 L1D_TLB_REFILL (which also counts refills that
-prefetches caused), 0x2D L2D_TLB_REFILL and 0x34 DTLB_WALK; `--events l3` swaps
+prefetches caused), 0x2D L2D_TLB_REFILL and 0x34 DTLB_WALK; `--events walk`
+swaps them for 0x34 DTLB_WALK, 0x8188 DTLB_WALK_BLOCK and 0x818A DTLB_WALK_PAGE
+(walks by the descriptor they ended in; a walk through a contiguous-hint entry
+is a block walk); `--events l3` swaps
 them for 0x81C5 L2D_CACHE_HIT_RD (L2 hits by demand reads), 0xA0 L3D_CACHE_RD
-(every read that reaches the L3, demand or prefetch, misses and translation
-walks) and 0x81C6 L3D_CACHE_HIT_RD (demand reads that hit in the L3), so the
+(reads that reach the L3; in this RTL load/store-origin reads only, without
+hardware-prefetch fills and translation walks, nevis0_l2_tagctl.sv lines 10297
+to 10304) and 0x81C6 L3D_CACHE_HIT_RD (demand reads that hit in the L3), so the
 L2 and L3 demand hits per program load are counted rather than inferred from
 the refills; the header names the columns. Hits over accesses (0x81C6 over
-0xA0) is not a demand hit rate, since 0xA0 also counts non-demand reads. The
+0xA0) is reported as an estimate: 0xA0's population is the RTL's reading, and
+it still includes software-prefetch reads. The
 columns are independent counts per load; a demand hit fraction derived from
 them (l3d_hit_rd over l1d_refill minus l2d_hit_rd) is an estimate that assumes
 a load-only chase's L1 refills are its demand reads, which the plan checks. A level with about 1.0 refills per load is the one that filled one

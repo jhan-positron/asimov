@@ -14,10 +14,13 @@
 # 0xA2 L3D read refill, plus 0x81BC L1D_CACHE_REFILL_HWPRF, 0x81BD L2D_CACHE_REFILL_HWPRF and
 # 0x0111 IMP_L2D_CACHE_REFILL_L1DHWPRF (refills a hardware prefetcher requested, by level and by
 # prefetcher). The core TLB set (--events tlb) keeps the first four and adds 0x05 L1D_TLB_REFILL,
-# 0x2D L2D_TLB_REFILL and 0x34 DTLB_WALK. The core hit set (--events l3) keeps the first four and
-# adds 0x81C5 L2D_CACHE_HIT_RD, 0xA0 L3D_CACHE_RD and 0x81C6 L3D_CACHE_HIT_RD (the L2 and L3 demand
-# read hits per load; 0xA0 counts every read that reaches the L3, demand or not, so hits over
-# accesses is not a demand hit rate). The CME set is cycles, 0x3246 CME_CYCLES, 0x327D inner
+# 0x2D L2D_TLB_REFILL and 0x34 DTLB_WALK. The core walk set (--events walk) keeps the first four and
+# adds 0x34 DTLB_WALK, 0x8188 DTLB_WALK_BLOCK and 0x818A DTLB_WALK_PAGE (walks by the descriptor
+# they ended in; a walk through a contiguous-hint entry is a block walk). The core hit set
+# (--events l3) keeps the first four and adds 0x81C5 L2D_CACHE_HIT_RD, 0xA0 L3D_CACHE_RD and 0x81C6
+# L3D_CACHE_HIT_RD (the L2 and L3 demand read hits per load; in this RTL 0xA0 counts load/store-origin
+# reads reaching the L3, without hardware-prefetch fills and translation walks, so hits over
+# accesses is reported as an estimate). The CME set is cycles, 0x3246 CME_CYCLES, 0x327D inner
 # refills, 0x327E outer refills, plus 0x3280 CME_L1D_CACHE_REFILL_RD (refills by loads), 0x32B2
 # CME_L1D_CACHE_REFILL_HWPRF (by the CME prefetcher) and 0x3281 CME_L1D_CACHE_REFILL_WR (by
 # stores; the chase has none). An added event that is refused costs its own column only: the
@@ -37,7 +40,8 @@
 #   G2  core OCM      from CPUs 2 and 8 (1 and 5 crosspoints at most): run 3's 4 KiB control; each
 #                     region dense, sparse and vary; all five dense and sparse. From CPU 2 the
 #                     per-region rows again with the TLB set (-tlb files), after a 32 MiB random
-#                     chain on 4 KiB pages that validates the TLB events (the stimulus on which they are expected to count)
+#                     chain on 4 KiB pages that validates the TLB events (the stimulus on which they are expected to count);
+#                     then the sparse per-region rows with the walk set (-walk files), after the same stimulus
 #   G3  CME chase     the run 3 CME DRAM sweep and controls (CPU 2 in streaming mode), then the
 #                     8 MiB sequential chain through the CME
 #   G4  CME OCM       each region dense, sparse and vary; all five dense and sparse
@@ -144,6 +148,16 @@ if [ "$HAVE_OCM" = 1 ]; then
                 run latency-ocm-region$r-dense-tlb-cpu$c.csv "$LAT" --cpu $c --perf --events tlb --mem ocm --ocm-regions $r --sizes 256K --fresh 3 --flush
                 run latency-ocm-region$r-tlb-cpu$c.csv "$LAT" --cpu $c --perf --events tlb --mem ocm --ocm-regions $r --sizes 256K --sparse --fresh 8 --flush
                 run latency-ocm-region$r-vary-tlb-cpu$c.csv "$LAT" --cpu $c --perf --events tlb --mem ocm --ocm-regions $r --sizes 256K --sparse-vary --fresh 8 --flush
+            done
+            say "## G2. OCM latency, walk counter set (cpu $c)"
+            # the walks split by the descriptor they ended in. On 4 KiB pages (boots A and B) every walk is
+            # a page walk, so the same 32 MiB stimulus validates 0x818A and shows 0x8188 at zero. On boots C
+            # and D a walk through a contiguous-hint entry counts as a block walk (Jesse's reading of
+            # nevis0_tlb_pagewalk.sv), which says what the walker used, where the map lines say only what
+            # the kernel wrote. Sparse rows only: one member line per 4 KiB page, the shape with the most walks.
+            run latency-dram-walk-cpu$c.csv "$LAT" --cpu $c --perf --events walk --no-thp --no-hugetlb --fresh 3 --sizes 32M
+            for r in 0 1 2 3 4; do
+                run latency-ocm-region$r-walk-cpu$c.csv "$LAT" --cpu $c --perf --events walk --mem ocm --ocm-regions $r --sizes 256K --sparse --fresh 8 --flush
             done
         fi
         [ "$QUICK" = 1 ] && break
