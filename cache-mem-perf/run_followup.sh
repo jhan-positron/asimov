@@ -18,9 +18,9 @@
 # adds 0x34 DTLB_WALK, 0x8188 DTLB_WALK_BLOCK and 0x818A DTLB_WALK_PAGE (walks by the descriptor
 # they ended in; a walk through a contiguous-hint entry is a block walk). The core hit set
 # (--events l3) keeps the first four and adds 0x81C5 L2D_CACHE_HIT_RD, 0xA0 L3D_CACHE_RD and 0x81C6
-# L3D_CACHE_HIT_RD (the L2 and L3 demand read hits per load; in this RTL 0xA0 counts load/store-origin
-# reads reaching the L3, without hardware-prefetch fills and translation walks, so hits over
-# accesses is reported as an estimate). The CME set is cycles, 0x3246 CME_CYCLES, 0x327D inner
+# L3D_CACHE_HIT_RD (the L2 and L3 demand read hits per load; in this RTL 0xA0 leaves out
+# hardware-prefetch fills and prefetch-origin walks and keeps the program's own page walks, so hits
+# over accesses is reported as an estimate). The CME set is cycles, 0x3246 CME_CYCLES, 0x327D inner
 # refills, 0x327E outer refills, plus 0x3280 CME_L1D_CACHE_REFILL_RD (refills by loads), 0x32B2
 # CME_L1D_CACHE_REFILL_HWPRF (by the CME prefetcher) and 0x3281 CME_L1D_CACHE_REFILL_WR (by
 # stores; the chase has none). An added event that is refused costs its own column only: the
@@ -152,9 +152,10 @@ if [ "$HAVE_OCM" = 1 ]; then
             say "## G2. OCM latency, walk counter set (cpu $c)"
             # the walks split by the descriptor they ended in. On 4 KiB pages (boots A and B) every walk is
             # a page walk, so the same 32 MiB stimulus validates 0x818A and shows 0x8188 at zero. On boots C
-            # and D a walk through a contiguous-hint entry counts as a block walk (Jesse's reading of
-            # nevis0_tlb_pagewalk.sv), which says what the walker used, where the map lines say only what
-            # the kernel wrote. Sparse rows only: one member line per 4 KiB page, the shape with the most walks.
+            # and D a walk through a contiguous-hint entry counts as a block walk (nevis0_tlb_pagewalk.sv line
+            # 3147), which says what the walker used, where the map lines say only what the kernel wrote. A
+            # zero block count is unvalidated until 0x8188 has read nonzero on some row (no block stimulus
+            # here). Sparse rows only: one member line per 4 KiB page, the shape with the most walks.
             run latency-dram-walk-cpu$c.csv "$LAT" --cpu $c --perf --events walk --no-thp --no-hugetlb --fresh 3 --sizes 32M
             for r in 0 1 2 3 4; do
                 run latency-ocm-region$r-walk-cpu$c.csv "$LAT" --cpu $c --perf --events walk --mem ocm --ocm-regions $r --sizes 256K --sparse --fresh 8 --flush

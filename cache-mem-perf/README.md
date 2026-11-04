@@ -272,15 +272,16 @@ three prefetch events for 0x05 L1D_TLB_REFILL (which also counts refills that
 prefetches caused), 0x2D L2D_TLB_REFILL and 0x34 DTLB_WALK; `--events walk`
 swaps them for 0x34 DTLB_WALK, 0x8188 DTLB_WALK_BLOCK and 0x818A DTLB_WALK_PAGE
 (walks by the descriptor they ended in; a walk through a contiguous-hint entry
-is a block walk); `--events l3` swaps
+is a block walk, nevis0_tlb_pagewalk.sv line 3147; a zero block count is
+unvalidated until the event has read nonzero); `--events l3` swaps
 them for 0x81C5 L2D_CACHE_HIT_RD (L2 hits by demand reads), 0xA0 L3D_CACHE_RD
-(reads that reach the L3; in this RTL load/store-origin reads only, without
-hardware-prefetch fills and translation walks, nevis0_l2_tagctl.sv lines 10297
-to 10304) and 0x81C6 L3D_CACHE_HIT_RD (demand reads that hit in the L3), so the
+(reads that reach the L3; in this RTL without hardware-prefetch fills and
+prefetch-origin walks, with the program's own page walks kept, nevis0_l2_tagctl.sv
+lines 10297 to 10304 and nevis0_tlb_pagewalk.sv line 3267) and 0x81C6 L3D_CACHE_HIT_RD (demand reads that hit in the L3), so the
 L2 and L3 demand hits per program load are counted rather than inferred from
 the refills; the header names the columns. Hits over accesses (0x81C6 over
 0xA0) is reported as an estimate: 0xA0's population is the RTL's reading, and
-it still includes software-prefetch reads. The
+it still includes the program's page walks and software-prefetch reads. The
 columns are independent counts per load; a demand hit fraction derived from
 them (l3d_hit_rd over l1d_refill minus l2d_hit_rd) is an estimate that assumes
 a load-only chase's L1 refills are its demand reads, which the plan checks. A level with about 1.0 refills per load is the one that filled one

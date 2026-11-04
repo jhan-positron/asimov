@@ -348,9 +348,11 @@ static inline void perf_open_tlb(struct perfgrp *g)
 /* The walk set (--events walk): the run 3 refill events plus 0x34 DTLB_WALK and its two parts by
  * the descriptor the walk ended in, 0x8188 DTLB_WALK_BLOCK (a block descriptor at level 1 or 2) and
  * 0x818A DTLB_WALK_PAGE (a page descriptor), C1-Nano TRM event list. On 4 KiB pages every walk is
- * a page walk. A walk through a contiguous-hint entry counts as a block walk (Jesse's reading of
- * nevis0_tlb_pagewalk.sv, 2026-11-04), which is what the boot C and D rows ask: whether the walker
- * used the larger translation, not only whether the kernel wrote the hint bit. */
+ * a page walk. A walk through a contiguous-hint entry counts as a block walk (nevis0_tlb_pagewalk.sv
+ * line 3147: block_entry or contig; nevis0_dpu_pmu.sv line 4304 routes it to 0x8188), which is what
+ * the boot C and D rows ask: whether the walker used the larger translation, not only whether the
+ * kernel wrote the hint bit. A zero 0x8188 is unvalidated until the event has read nonzero on some
+ * row (the script has no block-walk stimulus). */
 static inline void perf_open_walk(struct perfgrp *g)
 {
     static const uint64_t raw[PERF_N] = { 0, 0x03, 0x17, 0xA2, 0x34, 0x8188, 0x818A };
@@ -359,18 +361,19 @@ static inline void perf_open_walk(struct perfgrp *g)
 
 /* The hit set (--events l3): the run 3 refill events plus 0x81C5 L2D_CACHE_HIT_RD (L2 hits by
  * demand reads), 0xA0 L3D_CACHE_RD (reads that reach the L3; the TRM says every memory read
- * counted by L3D_CACHE, 0x2B, but in this RTL the event takes only load/store-origin requests of
- * type ReadOnce or ReadNotSharedDirty not sourced by the hardware prefetcher, so it leaves out
- * translation walks and hardware-prefetch fills: nevis0_l2_tagctl.sv lines 10297 to 10304, found by
- * Jesse 2026-11-04) and 0x81C6 L3D_CACHE_HIT_RD (demand
+ * counted by L3D_CACHE, 0x2B; in this RTL the event takes requests of type ReadOnce or
+ * ReadNotSharedDirty not sourced by the hardware prefetcher, and drops requests whose translation
+ * origin is a prefetcher, a TLB prefetch or the CME (origin_not_ldst), so hardware-prefetch fills and
+ * prefetch-origin walks are out while the program's own page walks stay in: nevis0_l2_tagctl.sv
+ * lines 10297 to 10304, nevis0_tlb_pagewalk.sv line 3267; Jesse 2026-11-04, codex R20) and 0x81C6 L3D_CACHE_HIT_RD (demand
  * reads counted by L3D_CACHE_RD that hit in the L3), C1-Nano TRM table 17-1. The columns are per
  * program load and are reported as independent counts. Derived ratios (l2d_hit_rd / l1d_refill as
  * the L2 demand hit fraction, l3d_hit_rd / (l1d_refill - l2d_hit_rd) as the L3 demand hit fraction)
  * are estimates that assume a load-only chase's L1 refills (0x03: refills by speculative loads or
  * stores) are its demand reads reaching the L2; the TRM states no such identity, so the plan checks
  * it on the 64 KiB row. l3d_hit_rd / l3d_access_rd is closer to a demand hit rate than the TRM
- * wording suggests, and is still reported as an estimate: the RTL population keeps software-prefetch
- * (PLD) reads, and the TRM does not state the exclusions. 0x2A
+ * wording suggests, and is still reported as an estimate: the RTL population keeps the program's
+ * page walks and software-prefetch (PLD) reads, and is not a count of the program's data reads. 0x2A
  * L3D_CACHE_REFILL is not in this set: the TRM lists it as not implemented (PMCEID1_EL0 ID10
  * resets to 0) and it read 0 on the emulator (Jesse, 2026-10-30); 0xA2 stays the L3 refill count. */
 static inline void perf_open_l3(struct perfgrp *g)
