@@ -348,10 +348,12 @@ static inline void perf_open_tlb(struct perfgrp *g)
  * demand reads), 0xA0 L3D_CACHE_RD (every read that reaches the L3: lower-level misses and
  * translation walks, demand or prefetch, TRM 0x2B and 0xA0) and 0x81C6 L3D_CACHE_HIT_RD (demand
  * reads counted by L3D_CACHE_RD that hit in the L3), C1-Nano TRM table 17-1. The columns are per
- * program load. Demand readings that use only events whose population the TRM states: L2 demand
- * hit fraction = l2d_hit_rd / l1d_refill (0x03 counts demand refills); demand L2 misses per load =
- * l1d_refill - l2d_hit_rd; L3 demand hit fraction = l3d_hit_rd / (l1d_refill - l2d_hit_rd).
- * l3d_hit_rd / l3d_access_rd is NOT a demand hit rate: 0xA0 also counts non-demand reads. 0x2A
+ * program load and are reported as independent counts. Derived ratios (l2d_hit_rd / l1d_refill as
+ * the L2 demand hit fraction, l3d_hit_rd / (l1d_refill - l2d_hit_rd) as the L3 demand hit fraction)
+ * are estimates that assume a load-only chase's L1 refills (0x03: refills by speculative loads or
+ * stores) are its demand reads reaching the L2; the TRM states no such identity, so the plan checks
+ * it on the 64 KiB row. l3d_hit_rd / l3d_access_rd is NOT a demand hit rate: 0xA0 also counts
+ * non-demand reads. 0x2A
  * L3D_CACHE_REFILL is not in this set: the TRM lists it as not implemented (PMCEID1_EL0 ID10
  * resets to 0) and it read 0 on the emulator (Jesse, 2026-10-30); 0xA2 stays the L3 refill count. */
 static inline void perf_open_l3(struct perfgrp *g)

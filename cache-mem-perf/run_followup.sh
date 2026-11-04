@@ -44,9 +44,9 @@
 #   G5  write cost    the one-core write rows of 16 KiB to 256 KiB with the run 3 program and with
 #                     run 2's (bandwidth_r2, no CME path), on one boot: the per-pass cost question
 #   G6  route flits   the dense per-region chase from every CPU to every OCM node (20 cells) under
-#                     cmncount, counting the data flits each crosspoint at the two ends of the route
-#                     sends in each direction: the route each cell takes, and a second sample of
-#                     every cell on one boot (CPU 2's and 8's cells already ran in G2)
+#                     cmncount, counting the data flits each crosspoint at the two ends sends in each
+#                     direction: an observation of outgoing data directions, not the route, and a
+#                     second sample of every cell on one boot (CPU 2's and 8's cells already ran in G2)
 #   G7  read variants the one-core read rows at 2 MiB and 32 MiB with the plain read loop, with a
 #                     software prefetch 4, 8 and 16 lines ahead, and over two streams, each under
 #                     the prefetch counters: whether the hardware prefetcher runs on a streaming read
@@ -205,10 +205,10 @@ done
 # section 11). The hop count assumes a Manhattan route. This phase counts, for each cell, the data
 # flits that the crosspoint of the CPU's DSU and the crosspoint of the home node transmit on each of
 # their four mesh directions (arm-cmn XP events mxp_<dir>_dat_txflit_valid, dir in e w n s), over the
-# whole dense chase command: which outgoing link each end uses, the request's first hop and the
-# response's first hop (TXFLIT counts transmitted flits only, so the response's last hop into the
-# DSU's crosspoint is not counted, and the DSU's counts also hold the chain build and the flushes).
-# The hop counts stay assumptions. Eight counters per command, which is the CMN's DTC counter count, so no
+# whole dense chase command: the outgoing data directions at both ends. These counts include the
+# chain build, the flush write-backs and unrelated traffic; read requests travel on the request
+# channel (mxp_<dir>_req_txflit_valid, not counted here), so they do not identify the read-request
+# route or the read response's final link. The hop counts stay coordinate assumptions. Eight counters per command, which is the CMN's DTC counter count, so no
 # multiplexing is expected; cmncount flags any. The event names are the arm-cmn driver's and are
 # not verified on this image: if one is absent the chase still runs, cmncount writes a '# cmncount:'
 # line, and G0's list of event names says what the image offers. XP node id = 64 x + 8 y.

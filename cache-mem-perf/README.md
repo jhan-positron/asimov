@@ -275,8 +275,10 @@ them for 0x81C5 L2D_CACHE_HIT_RD (L2 hits by demand reads), 0xA0 L3D_CACHE_RD
 walks) and 0x81C6 L3D_CACHE_HIT_RD (demand reads that hit in the L3), so the
 L2 and L3 demand hits per program load are counted rather than inferred from
 the refills; the header names the columns. Hits over accesses (0x81C6 over
-0xA0) is not a demand hit rate, since 0xA0 also counts non-demand reads; the
-demand L3 hit fraction is l3d_hit_rd over (l1d_refill minus l2d_hit_rd). A level with about 1.0 refills per load is the one that filled one
+0xA0) is not a demand hit rate, since 0xA0 also counts non-demand reads. The
+columns are independent counts per load; a demand hit fraction derived from
+them (l3d_hit_rd over l1d_refill minus l2d_hit_rd) is an estimate that assumes
+a load-only chase's L1 refills are its demand reads, which the plan checks. A level with about 1.0 refills per load is the one that filled one
 line per load. The events after the first three are optional: if the kernel
 refuses one, the row prints `-` in that column and keeps the others (a `# perf:
 event ... unavailable` line says so once per file). An event can also open and
