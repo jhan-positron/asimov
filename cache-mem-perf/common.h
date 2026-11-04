@@ -302,6 +302,18 @@ static inline void perf_open_set(struct perfgrp *g, const uint64_t raw[PERF_N], 
 }
 
 /* Whether event i of the group is open (its column is a number, not "-"). */
+/* One per-load or per-line counter value as a CSV field: "%.4f", or "%.3e" for a nonzero count that
+ * "%.4f" would print as 0.0000, so a small count stays distinct from an exact zero (and from "-", a
+ * refused event). Shared by latency.c (per load) and bandwidth.c (per 64 B line). */
+static inline void print_rate(uint64_t count, uint64_t per)
+{
+    double v = (double)count / (double)per;
+    if (count != 0 && v < 0.00005)
+        printf(",%.3e", v);
+    else
+        printf(",%.4f", v);
+}
+
 static inline int perf_have(const struct perfgrp *g, int i)
 {
     return g->ok && g->pos[i] >= 0;
@@ -333,10 +345,14 @@ static inline void perf_open_tlb(struct perfgrp *g)
 }
 
 /* The hit set (--events l3): the run 3 refill events plus 0x81C5 L2D_CACHE_HIT_RD (L2 hits by
- * demand reads), 0xA0 L3D_CACHE_RD (L3 accesses by reads) and 0x81C6 L3D_CACHE_HIT_RD (demand
- * reads counted by L3D_CACHE_RD that hit in the L3), C1-Nano TRM table 17-1. Per load they give the
- * L2 and L3 hit fractions directly, where run 3 could only infer them from the refills. 0x2A
- * L3D_CACHE_REFILL is not in this set: the TRM lists it as not implemented (PMCEID0_EL0 ID10
+ * demand reads), 0xA0 L3D_CACHE_RD (every read that reaches the L3: lower-level misses and
+ * translation walks, demand or prefetch, TRM 0x2B and 0xA0) and 0x81C6 L3D_CACHE_HIT_RD (demand
+ * reads counted by L3D_CACHE_RD that hit in the L3), C1-Nano TRM table 17-1. The columns are per
+ * program load. Demand readings that use only events whose population the TRM states: L2 demand
+ * hit fraction = l2d_hit_rd / l1d_refill (0x03 counts demand refills); demand L2 misses per load =
+ * l1d_refill - l2d_hit_rd; L3 demand hit fraction = l3d_hit_rd / (l1d_refill - l2d_hit_rd).
+ * l3d_hit_rd / l3d_access_rd is NOT a demand hit rate: 0xA0 also counts non-demand reads. 0x2A
+ * L3D_CACHE_REFILL is not in this set: the TRM lists it as not implemented (PMCEID1_EL0 ID10
  * resets to 0) and it read 0 on the emulator (Jesse, 2026-10-30); 0xA2 stays the L3 refill count. */
 static inline void perf_open_l3(struct perfgrp *g)
 {

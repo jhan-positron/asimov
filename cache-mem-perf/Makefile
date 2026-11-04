@@ -8,7 +8,7 @@ ifneq ($(findstring aarch64,$(shell $(CC) -dumpmachine)),)
 CME_KERN = cme_kern.S
 endif
 
-all: latency bandwidth bandwidth_r2 cmncount
+all: latency bandwidth bandwidth_r2 bandwidth_r3 cmncount
 latency: latency.c common.h $(CME_KERN)
 	$(CC) $(CFLAGS) -o $@ latency.c $(CME_KERN)
 bandwidth: bandwidth.c common.h $(CME_KERN)
@@ -18,6 +18,8 @@ cmncount: cmncount.c
 # run 2's bandwidth program (no CME path), the control for the per-pass cost question (run_followup.sh G5)
 bandwidth_r2: bandwidth_r2.c common.h
 	$(CC) $(CFLAGS) -o $@ bandwidth_r2.c
+bandwidth_r3: bandwidth_r3.c common.h $(CME_KERN)
+	$(CC) $(CFLAGS) -o $@ bandwidth_r3.c $(CME_KERN)
 # self-test of the CME kernels; needs an SME2 machine (or QEMU user mode) to run
 cme_test: cme_test.c common.h $(CME_KERN)
 	$(CC) $(CFLAGS) -o $@ cme_test.c $(CME_KERN)
@@ -25,5 +27,5 @@ cme_test: cme_test.c common.h $(CME_KERN)
 perf_cov_test: perf_cov_test.c common.h $(CME_KERN)
 	$(CC) $(CFLAGS) -o $@ perf_cov_test.c $(CME_KERN)
 clean:
-	rm -f latency bandwidth cmncount cme_test perf_cov_test
+	rm -f latency bandwidth bandwidth_r3 cmncount cme_test perf_cov_test
 .PHONY: all clean

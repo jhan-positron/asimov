@@ -163,22 +163,13 @@ static struct perfgrp pg;
 /* The counter columns of one row: per-load values and the coverage
  * (time_running / time_enabled, 1.0000 when the group counted the whole
  * walk), or "-" in every column and a comment line with the reason. */
-static void print_per_load(uint64_t count, uint64_t loads)
-{
-    double v = (double)count / (double)loads;
-    if (count != 0 && v < 0.00005)
-        printf(",%.3e", v); /* a count that %.4f would print as 0.0000: keep it distinct from an exact zero */
-    else
-        printf(",%.4f", v);
-}
-
 static void print_counters(const uint64_t c[PERF_N], uint64_t loads, int valid, const char *why)
 {
     if (pg.ok) {
         if (valid) {
             printf(",%.2f", (double)c[0] / (double)loads);
             for (int i = 1; i < PERF_N; i++) {
-                if (perf_have(&pg, i)) print_per_load(c[i], loads);
+                if (perf_have(&pg, i)) print_rate(c[i], loads) /* common.h: %.4f, or %.3e for a small nonzero count */;
                 else printf(",-"); /* an optional event this kernel refused to open */
             }
             printf(",%.4f", (double)pg.t_running / (double)pg.t_enabled);
@@ -383,6 +374,7 @@ int main(int argc, char **argv)
         pin_cpu(cfg.cpu);
     if (use_cme)
         require_cme();
+    if (ev_tlb && ev_l3) { fprintf(stderr, "--events tlb and --events l3 are exclusive\n"); usage(); }
     if (cfg.use_perf) {
         if (use_cme) perf_open_cme(&pg);
         else if (ev_tlb) perf_open_tlb(&pg);

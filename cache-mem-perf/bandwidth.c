@@ -54,6 +54,7 @@ struct result {
     uint64_t c[PERF_N]; /* --perf: the counts over the timed passes */
     int perf_valid;
     const char *perf_why;
+    double perf_cov;    /* --perf: running over enabled time of this rep, taken at its read (the group keeps only the last read's) */
 };
 
 struct thread {
@@ -126,7 +127,8 @@ __attribute__((noinline)) static void k_read_pf(const uint8_t *p, uint64_t bytes
 }
 
 /* The read loop over two streams: the first half of the buffer and the second half, 128 B from
- * each per iteration, so the two streams advance together. */
+ * each per iteration, so the two streams advance together. Called per segment, so on a multi-region
+ * OCM buffer each region is split in two; run_followup.sh G7 runs it on DRAM only. */
 __attribute__((noinline)) static void k_read_2s(const uint8_t *p, uint64_t bytes)
 {
     const uint8_t *end = p + bytes / 2;
@@ -333,8 +335,10 @@ static void *worker(void *arg)
             perf_stop(&pg);
             t->res[k][rep].bytes = bytes;
             t->res[k][rep].elapsed_s = t1 - t0;
-            if (cfg.use_perf)
+            if (cfg.use_perf) {
                 t->res[k][rep].perf_valid = perf_read(&pg, t->res[k][rep].c, &t->res[k][rep].perf_why);
+                t->res[k][rep].perf_cov = pg.t_enabled ? (double)pg.t_running / (double)pg.t_enabled : 0.0;
+            }
             pthread_barrier_wait(&bar);
         }
     }
@@ -393,6 +397,7 @@ int main(int argc, char **argv)
     if (cfg.ncpus && cfg.threads > cfg.ncpus)
         fprintf(stderr, "warning: %d threads on %d cpus\n", cfg.threads, cfg.ncpus);
     if (cfg.use_perf && cfg.threads != 1) { fprintf(stderr, "--perf needs --threads 1 (one counter group, one worker)\n"); usage(); }
+    if (cfg.use_perf && cfg.cme) { fprintf(stderr, "--perf counts the core cache set; it has no CME set here (latency --cme has one)\n"); usage(); }
     if (cfg.cme && (cfg.run[K_READ_PF4] || cfg.run[K_READ_PF8] || cfg.run[K_READ_PF16] || cfg.run[K_READ_2S])) {
         fprintf(stderr, "the read-pf and read-2s kernels have no CME form\n");
         usage();
@@ -444,11 +449,12 @@ int main(int argc, char **argv)
                 const struct result *r = &th[0].res[k][rep];
                 double lines = (double)r->bytes / LINE_BYTES;
                 if (r->perf_valid) {
-                    for (int i = 0; i < PERF_N; i++) {
-                        if (perf_have(&pg, i)) printf(",%.4f", (double)r->c[i] / lines);
+                    printf(",%.2f", (double)r->c[0] / lines); /* cycles per line */
+                    for (int i = 1; i < PERF_N; i++) {
+                        if (perf_have(&pg, i)) print_rate(r->c[i], (uint64_t)lines); /* common.h: %.4f, or %.3e for a small nonzero count */
                         else printf(",-");
                     }
-                    printf(",%.4f", (double)pg.t_running / (double)pg.t_enabled);
+                    printf(",%.4f", r->perf_cov);
                 } else {
                     for (int i = 0; i <= PERF_N; i++) printf(",-");
                 }

@@ -15,8 +15,9 @@
 # 0x0111 IMP_L2D_CACHE_REFILL_L1DHWPRF (refills a hardware prefetcher requested, by level and by
 # prefetcher). The core TLB set (--events tlb) keeps the first four and adds 0x05 L1D_TLB_REFILL,
 # 0x2D L2D_TLB_REFILL and 0x34 DTLB_WALK. The core hit set (--events l3) keeps the first four and
-# adds 0x81C5 L2D_CACHE_HIT_RD, 0xA0 L3D_CACHE_RD and 0x81C6 L3D_CACHE_HIT_RD (the L2 and L3 hit
-# fractions per load, measured). The CME set is cycles, 0x3246 CME_CYCLES, 0x327D inner
+# adds 0x81C5 L2D_CACHE_HIT_RD, 0xA0 L3D_CACHE_RD and 0x81C6 L3D_CACHE_HIT_RD (the L2 and L3 demand
+# read hits per load; 0xA0 counts every read that reaches the L3, demand or not, so hits over
+# accesses is not a demand hit rate). The CME set is cycles, 0x3246 CME_CYCLES, 0x327D inner
 # refills, 0x327E outer refills, plus 0x3280 CME_L1D_CACHE_REFILL_RD (refills by loads), 0x32B2
 # CME_L1D_CACHE_REFILL_HWPRF (by the CME prefetcher) and 0x3281 CME_L1D_CACHE_REFILL_WR (by
 # stores; the chase has none). An added event that is refused costs its own column only: the
@@ -188,11 +189,13 @@ fi
 # Run 3's one-core write rows of 16 to 256 KiB read 7.7 to 8.0 ns more per pass than run 2's
 # (asimov-c1nano-perf.html, table 4.3 and section 11). The hypothesis is the CME switch run 3 added
 # to the bandwidth program's pass loop. The same rows with both programs on one boot decide it:
-# if the difference is the program, bandwidth_r2 reads run 2's numbers and bandwidth run 3's.
+# if the difference is the program, bandwidth_r2 reads run 2's numbers and bandwidth_r3 run 3's.
+# bandwidth_r3 is run 3's bandwidth.c (ba834c0) kept verbatim: run 5 changed bandwidth.c, so the
+# current binary is not run 3's program. The G5 rows run two preserved programs, not the current one.
 say "## G5. one-core write rows, run 3 program and run 2 program (cpu $CPU)"
 for sp in 16K:256 48K:128 96K:64 256K:32; do
     s=${sp%%:*}; p=${sp##*:}
-    run bandwidth-write-small.csv "$BW" --threads 1 --cpus $CPU --bytes $s --kernel write --passes $p --reps 3
+    run bandwidth-write-small.csv "$BW3" --threads 1 --cpus $CPU --bytes $s --kernel write --passes $p --reps 3
     run bandwidth-write-small-r2prog.csv "$BW2" --threads 1 --cpus $CPU --bytes $s --kernel write --passes $p --reps 3
 done
 
@@ -202,8 +205,10 @@ done
 # section 11). The hop count assumes a Manhattan route. This phase counts, for each cell, the data
 # flits that the crosspoint of the CPU's DSU and the crosspoint of the home node transmit on each of
 # their four mesh directions (arm-cmn XP events mxp_<dir>_dat_txflit_valid, dir in e w n s), over the
-# whole dense chase command: which link each end uses, so the latency can be set against the real
-# first and last hops. Eight counters per command, which is the CMN's DTC counter count, so no
+# whole dense chase command: which outgoing link each end uses, the request's first hop and the
+# response's first hop (TXFLIT counts transmitted flits only, so the response's last hop into the
+# DSU's crosspoint is not counted, and the DSU's counts also hold the chain build and the flushes).
+# The hop counts stay assumptions. Eight counters per command, which is the CMN's DTC counter count, so no
 # multiplexing is expected; cmncount flags any. The event names are the arm-cmn driver's and are
 # not verified on this image: if one is absent the chase still runs, cmncount writes a '# cmncount:'
 # line, and G0's list of event names says what the image offers. XP node id = 64 x + 8 y.
@@ -230,9 +235,9 @@ fi
 # Run 3's one-core read reads 9.2 GB/s at 2 MiB and 32 MiB against 58 GB/s at 16 KiB, with 3.5 to 7.5
 # lines in flight by Little's law (asimov-c1nano-perf.html, table 4.3). The hypothesis is that the
 # plain ldp loop does not keep enough lines in flight: a streaming read depends on the hardware
-# prefetcher running ahead of it. The rows here are run 3's read row (the control, same command plus
-# --perf), the same loop with a PRFM PLDL1KEEP on every line 4, 8 and 16 lines ahead, and the loop
-# over two streams. The prefetch columns say whether the hardware prefetcher fills lines on the
+# prefetcher running ahead of it. The rows here are the plain read loop (the control: run 3 ran it
+# under --kernel all, here it is --kernel read plus --perf), the same loop with a PRFM PLDL1KEEP on
+# every line 4, 8 and 16 lines ahead, and the loop over two streams. The prefetch columns say whether the hardware prefetcher fills lines on the
 # plain row (0x81BC, 0x81BD, 0x0111 per line) and how the software hints change the refill mix.
 say "## G7. one-core read, software prefetch and two streams, prefetch counters (cpu $CPU)"
 for sp in 2M:4 32M:2; do

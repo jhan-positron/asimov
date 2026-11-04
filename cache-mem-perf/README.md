@@ -135,6 +135,7 @@ results:
 | `latency.c` | single-thread pointer chase; `--fresh`, `--flush`, `--sparse`, `--sparse-vary`, `--seq`, `--perf`, `--events` |
 | `bandwidth.c` | pinned threads, read / write / copy with `ldp`/`stp` q-register pairs; `ldr16`/`str16` for SPM; `read-pf4`/`-pf8`/`-pf16` (the read loop with a software prefetch hint that many lines ahead) and `read-2s` (two streams); `--perf` counts the prefetch set per line on one thread |
 | `bandwidth_r2.c` | run 2's bandwidth.c (commit 8ae533c) kept verbatim, built as `bandwidth_r2`: the control of run_followup.sh phase G5 for the per-pass write cost that run 3 added |
+| `bandwidth_r3.c` | run 3's bandwidth.c (commit ba834c0) kept verbatim, built as `bandwidth_r3`: the run 3 side of phase G5, since run 5 changed bandwidth.c |
 | `cmncount.c` | runs one command with mesh PMU events open (system-wide, on the PMU's CPU), appends one CSV line per event and one with the command's lifetime |
 | `cme_kern.S` | the chase and the read / write / copy loops again as streaming-mode SVE (`LD1D` + `LASTB`; `LD1B` / `ST1B` of four vectors and of one), used by `latency --cme` and `bandwidth --cme`; plus the register round trip and `RDSVL` |
 | `cme_test.c` | self-test of those kernels on any SME2 machine: chase, round trip, read fold, write pattern, copy; `make cme_test && ./cme_test` |
@@ -270,9 +271,12 @@ accounted for by these events", not a demand count. `--events tlb` swaps the
 three prefetch events for 0x05 L1D_TLB_REFILL (which also counts refills that
 prefetches caused), 0x2D L2D_TLB_REFILL and 0x34 DTLB_WALK; `--events l3` swaps
 them for 0x81C5 L2D_CACHE_HIT_RD (L2 hits by demand reads), 0xA0 L3D_CACHE_RD
-(L3 accesses by reads) and 0x81C6 L3D_CACHE_HIT_RD (demand reads that hit in
-the L3), so the L2 and L3 hit fractions per load are counted rather than
-inferred from the refills; the header names the columns. A level with about 1.0 refills per load is the one that filled one
+(every read that reaches the L3, demand or prefetch, misses and translation
+walks) and 0x81C6 L3D_CACHE_HIT_RD (demand reads that hit in the L3), so the
+L2 and L3 demand hits per program load are counted rather than inferred from
+the refills; the header names the columns. Hits over accesses (0x81C6 over
+0xA0) is not a demand hit rate, since 0xA0 also counts non-demand reads; the
+demand L3 hit fraction is l3d_hit_rd over (l1d_refill minus l2d_hit_rd). A level with about 1.0 refills per load is the one that filled one
 line per load. The events after the first three are optional: if the kernel
 refuses one, the row prints `-` in that column and keeps the others (a `# perf:
 event ... unavailable` line says so once per file). An event can also open and

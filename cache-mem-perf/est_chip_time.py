@@ -147,7 +147,7 @@ def main():
                  + r["lines_built"] * ASSUME["chain_build_ns_per_line"]
                  + r["fill_8b"] * ASSUME["fill_ns_per_8B"] + r["civac"] * ASSUME["civac_ns"])
             # not counted: the 32 empty timed brackets per command and the timer reads around each pass (unmeasured)
-        elif prog in ("bandwidth", "bandwidth_r2"):
+        elif prog in ("bandwidth", "bandwidth_r2", "bandwidth_r3"):
             r = bandwidth_cmd(a)
             t = (r["bw_s"] * 1e9 + r["fill_8b"] * ASSUME["fill_ns_per_8B"] + r["civac"] * ASSUME["civac_ns"]
                  + (r["calls"] * ASSUME["call_ns"] if "--cme" in a else 0))
