@@ -11,6 +11,15 @@
  *   read / write / copy : ldp/stp of q-register pairs (two 16 B accesses each)
  *   ldr16 / str16       : single ldr/str q (16 B, aligned), for SPM, which
  *                         accepts only aligned 8, 16 or 32 B accesses
+ *   read-pf4 / -pf8 / -pf16 : the read loop with a PRFM PLDL1KEEP (a software
+ *                         prefetch hint into the L1) on every line, 4, 8 or 16
+ *                         lines ahead of the loads
+ *   read-2s             : the read loop over two streams at once, the two halves
+ *                         of the buffer, 128 B from each per iteration
+ * --perf (one thread only): the core prefetch counter set of common.h (cycles,
+ *   the L1, L2 and L3 refills, the refills by the hardware prefetchers) is
+ *   counted around the timed passes of each rep and printed per 64 B line of
+ *   data moved, with the coverage column, as latency.c prints them per load.
  * --flush-before: DC CIVAC the buffer before each timed rep, so reads come
  *   from the home node (OCM / SLC), not from L1/L2/L3.
  * --flush-after: DC CIVAC inside the timed region after the passes, so a
@@ -26,19 +35,26 @@
 #define MAX_CPUS 64
 #define MAX_REPS 32
 
-enum kernel { K_READ, K_WRITE, K_COPY, K_LDR16, K_STR16, K_COUNT };
-static const char *kernel_name[K_COUNT] = { "read", "write", "copy", "ldr16", "str16" };
+enum kernel { K_READ, K_WRITE, K_COPY, K_LDR16, K_STR16, K_READ_PF4, K_READ_PF8, K_READ_PF16, K_READ_2S, K_COUNT };
+static const char *kernel_name[K_COUNT] = { "read", "write", "copy", "ldr16", "str16", "read-pf4", "read-pf8", "read-pf16", "read-2s" };
+static const int kernel_pf_lines[K_COUNT] = { 0, 0, 0, 0, 0, 4, 8, 16, 0 }; /* prefetch distance in lines of the read-pf kernels */
 
 static struct {
     int threads, ncpus, cpus[MAX_CPUS];
     uint64_t bytes;
     int run[K_COUNT];
-    int passes, reps, flush_before, flush_after, cme;
+    int passes, reps, flush_before, flush_after, cme, use_perf;
     enum mem_kind kind;
     int regions[MAX_SEGS], nregions;
 } cfg = { .threads = 1, .bytes = 1 << 20, .passes = 4, .reps = 3, .kind = MEM_DRAM };
 
-struct result { uint64_t bytes; double elapsed_s; };
+struct result {
+    uint64_t bytes;
+    double elapsed_s;
+    uint64_t c[PERF_N]; /* --perf: the counts over the timed passes */
+    int perf_valid;
+    const char *perf_why;
+};
 
 struct thread {
     int idx, cpu;
@@ -48,6 +64,7 @@ struct thread {
 };
 
 static pthread_barrier_t bar;
+static struct perfgrp pg; /* --perf: opened by the one worker thread, read by main after the first barrier */
 
 static void parse_cpus(char *list)
 {
@@ -87,6 +104,41 @@ __attribute__((noinline)) static void k_read(const uint8_t *p, uint64_t bytes)
         "ldp q12, q13, [%[p], #192]\n\t" "ldp q14, q15, [%[p], #224]\n\t"
         "add %[p], %[p], #256\n\t" "cmp %[p], %[end]\n\t" "b.lo 1b\n\t"
         : [p] "+r"(p) : [end] "r"(end) : QCLOBBER);
+}
+
+/* The read loop with a PRFM PLDL1KEEP on every line `ahead` bytes in front of the loads (four
+ * hints per 256 B iteration). The hint pointer runs past the end of the buffer by `ahead` bytes
+ * on the last iterations; PRFM is a hint and does not fault on an unmapped address. */
+__attribute__((noinline)) static void k_read_pf(const uint8_t *p, uint64_t bytes, uint64_t ahead)
+{
+    const uint8_t *end = p + bytes;
+    const uint8_t *q = p + ahead;
+    __asm__ volatile(
+        "1:\n\t"
+        "prfm pldl1keep, [%[q]]\n\t"       "prfm pldl1keep, [%[q], #64]\n\t"
+        "prfm pldl1keep, [%[q], #128]\n\t" "prfm pldl1keep, [%[q], #192]\n\t"
+        "ldp q0, q1, [%[p]]\n\t"       "ldp q2, q3, [%[p], #32]\n\t"
+        "ldp q4, q5, [%[p], #64]\n\t"  "ldp q6, q7, [%[p], #96]\n\t"
+        "ldp q8, q9, [%[p], #128]\n\t" "ldp q10, q11, [%[p], #160]\n\t"
+        "ldp q12, q13, [%[p], #192]\n\t" "ldp q14, q15, [%[p], #224]\n\t"
+        "add %[p], %[p], #256\n\t" "add %[q], %[q], #256\n\t" "cmp %[p], %[end]\n\t" "b.lo 1b\n\t"
+        : [p] "+&r"(p), [q] "+&r"(q) : [end] "r"(end) : QCLOBBER);
+}
+
+/* The read loop over two streams: the first half of the buffer and the second half, 128 B from
+ * each per iteration, so the two streams advance together. */
+__attribute__((noinline)) static void k_read_2s(const uint8_t *p, uint64_t bytes)
+{
+    const uint8_t *end = p + bytes / 2;
+    const uint8_t *r = end;
+    __asm__ volatile(
+        "1:\n\t"
+        "ldp q0, q1, [%[p]]\n\t"       "ldp q2, q3, [%[p], #32]\n\t"
+        "ldp q4, q5, [%[p], #64]\n\t"  "ldp q6, q7, [%[p], #96]\n\t"
+        "ldp q8, q9, [%[r]]\n\t"       "ldp q10, q11, [%[r], #32]\n\t"
+        "ldp q12, q13, [%[r], #64]\n\t" "ldp q14, q15, [%[r], #96]\n\t"
+        "add %[p], %[p], #128\n\t" "add %[r], %[r], #128\n\t" "cmp %[p], %[end]\n\t" "b.lo 1b\n\t"
+        : [p] "+&r"(p), [r] "+&r"(r) : [end] "r"(end) : QCLOBBER); /* early-clobber: r starts equal to end and must not share its register */
 }
 
 __attribute__((noinline)) static void k_write(uint8_t *p, uint64_t bytes, uint64_t v)
@@ -173,6 +225,8 @@ __attribute__((noinline)) static void k_copy(uint8_t *d, const uint8_t *s, uint6
 }
 static void k_ldr16(const uint8_t *p, uint64_t bytes) { k_read(p, bytes); }
 static void k_str16(uint8_t *p, uint64_t bytes, uint64_t v) { k_write(p, bytes, v); }
+static void k_read_pf(const uint8_t *p, uint64_t bytes, uint64_t ahead) { (void)ahead; k_read(p, bytes); }
+static void k_read_2s(const uint8_t *p, uint64_t bytes) { k_read(p, bytes); }
 #endif
 
 static volatile uint64_t cme_fold; /* XOR of the CME read kernels' folds; keeps nothing, printed nowhere */
@@ -200,6 +254,8 @@ static uint64_t pass(enum kernel k, struct thread *t, uint64_t v)
         case K_COPY: k_copy(t->b.seg[s].base, a, n); break;
         case K_LDR16: k_ldr16(a, n); break;
         case K_STR16: k_str16(a, n, v); break;
+        case K_READ_PF4: case K_READ_PF8: case K_READ_PF16: k_read_pf(a, n, (uint64_t)kernel_pf_lines[k] * LINE_BYTES); break;
+        case K_READ_2S: k_read_2s(a, n); break;
         default: break;
         }
     }
@@ -253,6 +309,8 @@ static void *worker(void *arg)
         pin_cpu(t->cpu);
     if (cfg.cme)
         require_cme();
+    if (cfg.use_perf)
+        perf_open(&pg); /* on this thread, so the group counts the pinned worker */
     alloc_thread_bufs(t);
     pthread_barrier_wait(&bar); /* all buffers exist before anyone starts timing */
 
@@ -264,6 +322,7 @@ static void *worker(void *arg)
             if (cfg.flush_before)
                 flush_buf(&t->a);
             pthread_barrier_wait(&bar);
+            perf_start(&pg);
             double t0 = now_s();
             uint64_t bytes = 0;
             for (int p = 0; p < cfg.passes; p++)
@@ -271,8 +330,11 @@ static void *worker(void *arg)
             if (cfg.flush_after)
                 flush_buf(k == K_COPY ? &t->b : &t->a);
             double t1 = now_s();
+            perf_stop(&pg);
             t->res[k][rep].bytes = bytes;
             t->res[k][rep].elapsed_s = t1 - t0;
+            if (cfg.use_perf)
+                t->res[k][rep].perf_valid = perf_read(&pg, t->res[k][rep].c, &t->res[k][rep].perf_why);
             pthread_barrier_wait(&bar);
         }
     }
@@ -282,11 +344,14 @@ static void *worker(void *arg)
 static void usage(void)
 {
     fprintf(stderr,
-            "usage: bandwidth [--threads T --cpus LIST] [--bytes B] [--kernel read|write|copy|all|ldr16|str16]\n"
-            "                 [--passes P] [--reps R] [--mem dram|ocm|spm] [--ocm-regions 0,1,..]\n"
+            "usage: bandwidth [--threads T --cpus LIST] [--bytes B] [--kernel read|write|copy|all|ldr16|str16|read-pf4|read-pf8|read-pf16|read-2s]\n"
+            "                 [--passes P] [--reps R] [--mem dram|ocm|spm] [--ocm-regions 0,1,..] [--perf]\n"
             "                 [--flush-before] [--flush-after] [--cme] [--no-hugetlb] [--no-thp] [--ocm-*/--spm-* overrides]\n"
             "  bytes is per thread and must be a multiple of 256 (1024 with --cme); cpus: \"2,4,6\" or \"2-9\" or \"2-8:2\"\n"
-            "  --cme: run the kernels through the CME in streaming mode (needs SME2, SVL 64 B)\n");
+            "  --cme: run the kernels through the CME in streaming mode (needs SME2, SVL 64 B)\n"
+            "  read-pf4/8/16: the read loop with a PRFM PLDL1KEEP on every line that many lines ahead; read-2s: two streams\n"
+            "    over the two halves of the buffer (core kernels only, no CME form)\n"
+            "  --perf: count the core prefetch set around the timed passes, printed per 64 B line (needs --threads 1)\n");
     exit(2);
 }
 
@@ -302,6 +367,7 @@ int main(int argc, char **argv)
         if (!strcmp(a, "--flush-before")) cfg.flush_before = 1;
         else if (!strcmp(a, "--flush-after")) cfg.flush_after = 1;
         else if (!strcmp(a, "--cme")) cfg.cme = 1;
+        else if (!strcmp(a, "--perf")) cfg.use_perf = 1;
         else if (!strcmp(a, "--threads") && more) { cfg.threads = atoi(argv[++i]); threads_given = 1; }
         else if (!strcmp(a, "--cpus") && more) parse_cpus(argv[++i]);
         else if (!strcmp(a, "--bytes") && more) cfg.bytes = parse_bytes(argv[++i]);
@@ -326,6 +392,11 @@ int main(int argc, char **argv)
         usage();
     if (cfg.ncpus && cfg.threads > cfg.ncpus)
         fprintf(stderr, "warning: %d threads on %d cpus\n", cfg.threads, cfg.ncpus);
+    if (cfg.use_perf && cfg.threads != 1) { fprintf(stderr, "--perf needs --threads 1 (one counter group, one worker)\n"); usage(); }
+    if (cfg.cme && (cfg.run[K_READ_PF4] || cfg.run[K_READ_PF8] || cfg.run[K_READ_PF16] || cfg.run[K_READ_2S])) {
+        fprintf(stderr, "the read-pf and read-2s kernels have no CME form\n");
+        usage();
+    }
     if (cfg.kind == MEM_SPM && (cfg.run[K_READ] || cfg.run[K_WRITE] || cfg.run[K_COPY]))
         fprintf(stderr, "warning: SPM accepts only aligned 8/16/32 B accesses; ldr16/str16 are the safe kernels\n");
 
@@ -342,7 +413,13 @@ int main(int argc, char **argv)
     }
     pthread_barrier_wait(&bar); /* buffers allocated */
     printf("# backing=%s\n", th[0].a.backing);
-    printf("mem,kernel,threads,bytes_per_thread,rep,total_bytes,elapsed_s,aggregate_GBps,per_thread_min_GBps,per_thread_max_GBps\n");
+    printf("mem,kernel,threads,bytes_per_thread,rep,total_bytes,elapsed_s,aggregate_GBps,per_thread_min_GBps,per_thread_max_GBps");
+    if (pg.ok) {
+        for (int i = 0; i < PERF_N; i++)
+            printf(",%s_per_line", pg.names[i]);
+        printf(",perf_cov");
+    }
+    printf("\n");
     for (int k = 0; k < K_COUNT; k++) {
         if (!cfg.run[k]) continue;
         double best = 0;
@@ -361,11 +438,30 @@ int main(int argc, char **argv)
             }
             double agg = (double)total / longest / 1e9;
             if (agg > best) best = agg;
-            printf("%s,%s%s,%d,%llu,%d,%llu,%.6f,%.3f,%.3f,%.3f\n", mem_name(cfg.kind), cfg.cme ? "cme-" : "", kernel_name[k], cfg.threads,
+            printf("%s,%s%s,%d,%llu,%d,%llu,%.6f,%.3f,%.3f,%.3f", mem_name(cfg.kind), cfg.cme ? "cme-" : "", kernel_name[k], cfg.threads,
                    (unsigned long long)cfg.bytes, rep, (unsigned long long)total, longest, agg, mn, mx);
+            if (pg.ok) { /* one thread: its counts per 64 B line moved in the timed passes, as latency.c prints them per load */
+                const struct result *r = &th[0].res[k][rep];
+                double lines = (double)r->bytes / LINE_BYTES;
+                if (r->perf_valid) {
+                    for (int i = 0; i < PERF_N; i++) {
+                        if (perf_have(&pg, i)) printf(",%.4f", (double)r->c[i] / lines);
+                        else printf(",-");
+                    }
+                    printf(",%.4f", (double)pg.t_running / (double)pg.t_enabled);
+                } else {
+                    for (int i = 0; i <= PERF_N; i++) printf(",-");
+                }
+                printf("\n");
+                if (!r->perf_valid) printf("# perf: counters of the row above are invalid: %s\n", r->perf_why);
+            } else
+                printf("\n");
         }
-        printf("%s,%s%s,%d,%llu,best,-,-,%.3f,-,-\n", mem_name(cfg.kind), cfg.cme ? "cme-" : "", kernel_name[k], cfg.threads,
+        printf("%s,%s%s,%d,%llu,best,-,-,%.3f,-,-", mem_name(cfg.kind), cfg.cme ? "cme-" : "", kernel_name[k], cfg.threads,
                (unsigned long long)cfg.bytes, best);
+        if (pg.ok)
+            for (int i = 0; i <= PERF_N; i++) printf(",-");
+        printf("\n");
         fflush(stdout);
     }
     for (int i = 0; i < cfg.threads; i++)

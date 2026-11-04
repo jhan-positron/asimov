@@ -240,6 +240,7 @@ struct perfgrp {
 };
 static const char *perf_name[PERF_N] = { "cycles", "l1d_refill", "l2d_refill", "l3d_refill_rd", "l1d_refill_hwprf", "l2d_refill_hwprf", "l2d_refill_l1dhwprf" };
 static const char *perf_name_tlb[PERF_N] = { "cycles", "l1d_refill", "l2d_refill", "l3d_refill_rd", "l1d_tlb_refill", "l2d_tlb_refill", "dtlb_walk" };
+static const char *perf_name_l3[PERF_N] = { "cycles", "l1d_refill", "l2d_refill", "l3d_refill_rd", "l2d_hit_rd", "l3d_access_rd", "l3d_hit_rd" };
 
 static inline int perf_open_one(struct perf_event_attr *a, int group)
 {
@@ -329,6 +330,18 @@ static inline void perf_open_tlb(struct perfgrp *g)
 {
     static const uint64_t raw[PERF_N] = { 0, 0x03, 0x17, 0xA2, 0x05, 0x2D, 0x34 };
     perf_open_set(g, raw, perf_name_tlb);
+}
+
+/* The hit set (--events l3): the run 3 refill events plus 0x81C5 L2D_CACHE_HIT_RD (L2 hits by
+ * demand reads), 0xA0 L3D_CACHE_RD (L3 accesses by reads) and 0x81C6 L3D_CACHE_HIT_RD (demand
+ * reads counted by L3D_CACHE_RD that hit in the L3), C1-Nano TRM table 17-1. Per load they give the
+ * L2 and L3 hit fractions directly, where run 3 could only infer them from the refills. 0x2A
+ * L3D_CACHE_REFILL is not in this set: the TRM lists it as not implemented (PMCEID0_EL0 ID10
+ * resets to 0) and it read 0 on the emulator (Jesse, 2026-10-30); 0xA2 stays the L3 refill count. */
+static inline void perf_open_l3(struct perfgrp *g)
+{
+    static const uint64_t raw[PERF_N] = { 0, 0x03, 0x17, 0xA2, 0x81C5, 0xA0, 0x81C6 };
+    perf_open_set(g, raw, perf_name_l3);
 }
 
 static inline void perf_open_cme(struct perfgrp *g)

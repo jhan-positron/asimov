@@ -14,7 +14,9 @@
 # 0xA2 L3D read refill, plus 0x81BC L1D_CACHE_REFILL_HWPRF, 0x81BD L2D_CACHE_REFILL_HWPRF and
 # 0x0111 IMP_L2D_CACHE_REFILL_L1DHWPRF (refills a hardware prefetcher requested, by level and by
 # prefetcher). The core TLB set (--events tlb) keeps the first four and adds 0x05 L1D_TLB_REFILL,
-# 0x2D L2D_TLB_REFILL and 0x34 DTLB_WALK. The CME set is cycles, 0x3246 CME_CYCLES, 0x327D inner
+# 0x2D L2D_TLB_REFILL and 0x34 DTLB_WALK. The core hit set (--events l3) keeps the first four and
+# adds 0x81C5 L2D_CACHE_HIT_RD, 0xA0 L3D_CACHE_RD and 0x81C6 L3D_CACHE_HIT_RD (the L2 and L3 hit
+# fractions per load, measured). The CME set is cycles, 0x3246 CME_CYCLES, 0x327D inner
 # refills, 0x327E outer refills, plus 0x3280 CME_L1D_CACHE_REFILL_RD (refills by loads), 0x32B2
 # CME_L1D_CACHE_REFILL_HWPRF (by the CME prefetcher) and 0x3281 CME_L1D_CACHE_REFILL_WR (by
 # stores; the chase has none). An added event that is refused costs its own column only: the
@@ -29,7 +31,8 @@
 # L2, L3 and CME):
 #   G0  sysinfo       as run_asimov.sh phase 0, plus the kernel command line and the PMU counter count
 #   G1  core chase    the run 3 DRAM sweep (4 KiB to 32 MiB, repeated, fresh, flushed) on CPU 2,
-#                     then the 8 MiB sequential chain, flushed (the prefetch stimulus)
+#                     then the 8 MiB sequential chain, flushed (the prefetch stimulus); the 64 KiB
+#                     to 512 KiB rows again with the hit set (the L2 and L3 hit fractions)
 #   G2  core OCM      from CPUs 2 and 8 (1 and 5 crosspoints at most): run 3's 4 KiB control; each
 #                     region dense, sparse and vary; all five dense and sparse. From CPU 2 the
 #                     per-region rows again with the TLB set (-tlb files), after a 32 MiB random
@@ -43,7 +46,10 @@
 #                     cmncount, counting the data flits each crosspoint at the two ends of the route
 #                     sends in each direction: the route each cell takes, and a second sample of
 #                     every cell on one boot (CPU 2's and 8's cells already ran in G2)
-# No bandwidth rows beyond G5; the mesh counters are used only in G6.
+#   G7  read variants the one-core read rows at 2 MiB and 32 MiB with the plain read loop, with a
+#                     software prefetch 4, 8 and 16 lines ahead, and over two streams, each under
+#                     the prefetch counters: whether the hardware prefetcher runs on a streaming read
+# No bandwidth rows beyond G5 and G7; the mesh counters are used only in G6.
 # Chip time: `sh run_followup.sh --dry-run | python3 est_chip_time.py` (est.; see the plan).
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -90,6 +96,11 @@ cpu_set_online "$OFFLINE_CPU" 0
 say "## G1. core DRAM latency (cpu $CPU)"
 run latency-dram-small.csv "$LAT" --cpu $CPU --perf --loads 64K --reps 3 \
     --sizes 4K,8K,16K,24K,32K,48K,64K,96K,128K,192K,256K,384K
+# the L2-to-L3 rows again with the hit set: run 3 inferred a 42 % L2 hit fraction at 192 KiB from the
+# refills; these rows count the L2 and L3 demand read hits per load. 64 KiB (in the L2) and 512 KiB
+# (beyond the L3) bracket the sweep.
+run latency-dram-small-l3.csv "$LAT" --cpu $CPU --perf --events l3 --loads 64K --reps 3 \
+    --sizes 64K,96K,128K,192K,256K,384K,512K
 if [ "$QUICK" = 1 ]; then
     run latency-dram-large.csv "$LAT" --cpu $CPU --perf --fresh 3 --sizes 512K,1M,2M,4M
     run latency-dram-flushed.csv "$LAT" --cpu $CPU --perf --fresh 3 --flush --sizes 2M
@@ -214,6 +225,23 @@ if [ "$HAVE_OCM" = 1 ]; then
 else
     say "## G6. route rows skipped: no /dev/ocm"
 fi
+
+# ---- G7. one-core streaming read: software prefetch distances and two streams, under the counters ----
+# Run 3's one-core read reads 9.2 GB/s at 2 MiB and 32 MiB against 58 GB/s at 16 KiB, with 3.5 to 7.5
+# lines in flight by Little's law (asimov-c1nano-perf.html, table 4.3). The hypothesis is that the
+# plain ldp loop does not keep enough lines in flight: a streaming read depends on the hardware
+# prefetcher running ahead of it. The rows here are run 3's read row (the control, same command plus
+# --perf), the same loop with a PRFM PLDL1KEEP on every line 4, 8 and 16 lines ahead, and the loop
+# over two streams. The prefetch columns say whether the hardware prefetcher fills lines on the
+# plain row (0x81BC, 0x81BD, 0x0111 per line) and how the software hints change the refill mix.
+say "## G7. one-core read, software prefetch and two streams, prefetch counters (cpu $CPU)"
+for sp in 2M:4 32M:2; do
+    s=${sp%%:*}; p=${sp##*:}
+    for k in read read-pf4 read-pf8 read-pf16 read-2s; do
+        run bandwidth-read-prefetch.csv "$BW" --threads 1 --cpus $CPU --bytes $s --kernel $k --passes $p --reps 3 --perf
+    done
+    [ "$QUICK" = 1 ] && break
+done
 
 cpu_set_online "$OFFLINE_CPU" 1
 [ "$DRY" = 1 ] && exit 0

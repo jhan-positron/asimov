@@ -133,12 +133,12 @@ results:
 |---|---|
 | `common.h` | buffers in DRAM (MAP_HUGETLB, else THP, or 4 KiB pages with `--no-thp`), OCM regions, SPM; flush; core perf counters |
 | `latency.c` | single-thread pointer chase; `--fresh`, `--flush`, `--sparse`, `--sparse-vary`, `--seq`, `--perf`, `--events` |
-| `bandwidth.c` | pinned threads, read / write / copy with `ldp`/`stp` q-register pairs; `ldr16`/`str16` for SPM |
+| `bandwidth.c` | pinned threads, read / write / copy with `ldp`/`stp` q-register pairs; `ldr16`/`str16` for SPM; `read-pf4`/`-pf8`/`-pf16` (the read loop with a software prefetch hint that many lines ahead) and `read-2s` (two streams); `--perf` counts the prefetch set per line on one thread |
 | `bandwidth_r2.c` | run 2's bandwidth.c (commit 8ae533c) kept verbatim, built as `bandwidth_r2`: the control of run_followup.sh phase G5 for the per-pass write cost that run 3 added |
 | `cmncount.c` | runs one command with mesh PMU events open (system-wide, on the PMU's CPU), appends one CSV line per event and one with the command's lifetime |
 | `cme_kern.S` | the chase and the read / write / copy loops again as streaming-mode SVE (`LD1D` + `LASTB`; `LD1B` / `ST1B` of four vectors and of one), used by `latency --cme` and `bandwidth --cme`; plus the register round trip and `RDSVL` |
 | `cme_test.c` | self-test of those kernels on any SME2 machine: chase, round trip, read fold, write pattern, copy; `make cme_test && ./cme_test` |
-| `run_followup.sh` | the run 3 follow-up (follow-up-run-plan.md): the OCM chase rows dense, sparse and vary from CPUs 2 and 8, the TLB counter set on the CPU 2 rows with its own validation row, the CME latency sweep, and a sequential chain as the prefetch stimulus, all with the prefetch-refill counters, plus the small one-core write rows with run 3's and run 2's bandwidth programs (G5) and the 20 dense OCM cells under the crosspoint flit counters (G6); meant to run once per boot (normal, prefetchers off, larger OCM pages, both) |
+| `run_followup.sh` | the run 3 follow-up (follow-up-run-plan.md): the OCM chase rows dense, sparse and vary from CPUs 2 and 8, the TLB counter set on the CPU 2 rows with its own validation row, the CME latency sweep, and a sequential chain as the prefetch stimulus, all with the prefetch-refill counters, plus the small one-core write rows with run 3's and run 2's bandwidth programs (G5) and the 20 dense OCM cells under the crosspoint flit counters (G6), the 64 KiB to 512 KiB chase rows with the L2 and L3 hit set (G1, run 5) and the one-core read rows with software prefetch distances and two streams under the prefetch counters (G7, run 5); meant to run once per boot (normal, prefetchers off, larger OCM pages, both) |
 | `test_lat_rows.py` | test of the latency CSV reader in gen_run3.py over run 2, run 3 and run 4 row shapes, refused and invalid counters; `python3 test_lat_rows.py` |
 | `perf_cov_test.c` | host test that a multiplexed counter row is rejected and the next row is not; `make perf_cov_test && taskset -c 2 ./perf_cov_test` on an Arm machine |
 | `est_chip_time.py` | sizes a run from `sh run_asimov.sh --dry-run`: exact counts per command, labelled time assumptions |
@@ -268,8 +268,11 @@ IMP_L2D_CACHE_REFILL_L1DHWPRF (the L1D prefetcher's requests). Each is its own
 rate; the L2 column minus the two L2 prefetch columns is "L2 refills not
 accounted for by these events", not a demand count. `--events tlb` swaps the
 three prefetch events for 0x05 L1D_TLB_REFILL (which also counts refills that
-prefetches caused), 0x2D L2D_TLB_REFILL and 0x34 DTLB_WALK; the header names
-the columns. A level with about 1.0 refills per load is the one that filled one
+prefetches caused), 0x2D L2D_TLB_REFILL and 0x34 DTLB_WALK; `--events l3` swaps
+them for 0x81C5 L2D_CACHE_HIT_RD (L2 hits by demand reads), 0xA0 L3D_CACHE_RD
+(L3 accesses by reads) and 0x81C6 L3D_CACHE_HIT_RD (demand reads that hit in
+the L3), so the L2 and L3 hit fractions per load are counted rather than
+inferred from the refills; the header names the columns. A level with about 1.0 refills per load is the one that filled one
 line per load. The events after the first three are optional: if the kernel
 refuses one, the row prints `-` in that column and keeps the others (a `# perf:
 event ... unavailable` line says so once per file). An event can also open and
@@ -312,6 +315,15 @@ mem,kernel,threads,bytes_per_thread,rep,total_bytes,elapsed_s,aggregate_GBps,per
 
 `aggregate_GBps` is total bytes over the slowest thread's time. Copy counts
 both the bytes read and the bytes written.
+
+With `--perf` (one thread) the row carries the core prefetch counter set of
+`latency` per 64 B line of data moved in the timed passes
+(`cycles_per_line`, `l1d_refill_per_line`, ..., `perf_cov`), with the same `-`
+and `# perf:` conventions; the `best` row prints `-` in those columns. The
+`read-pf4`, `read-pf8` and `read-pf16` kernels are the read loop with a `PRFM
+PLDL1KEEP` on every line that many lines ahead of the loads; `read-2s` reads
+the two halves of the buffer as two streams, 128 B from each per iteration.
+Neither has a CME form.
 
 `cmncount` appends to `cmn-counts.csv`:
 

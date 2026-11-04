@@ -110,7 +110,8 @@ def bandwidth_cmd(args):
         r["calls"] += reps * (passes + 1) * threads * nseg
         if flush_before:
             r["civac"] += reps * size * threads // 64
-        key = ("cme_" if cme else "core_") + ("read" if k in ("read", "ldr16") else "write" if k in ("write", "str16") else "copy") + "_gbps"
+        # read-pf4/8/16 and read-2s are costed at the plain read rate (est.): a faster read only shortens them
+        key = ("cme_" if cme else "core_") + ("read" if k.startswith("read") or k == "ldr16" else "write" if k in ("write", "str16") else "copy") + "_gbps"
         r["bw_s"] += reps * (passes + 1) * per_pass / (ASSUME[key] * 1e9) / threads * threads
     r["fill_8b"] = size * threads * (2 if "copy" in kernels else 1) // 8
     return r

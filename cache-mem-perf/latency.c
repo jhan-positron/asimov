@@ -48,7 +48,9 @@
  * --perf: cycles and six raw events are counted around each timed walk and
  *   printed per load (common.h names the sets): the run 3 refill events plus
  *   the three hardware-prefetch refill events, or with --events tlb the run 3
- *   events plus the L1D and L2D TLB refills and the TLB walks.
+ *   events plus the L1D and L2D TLB refills and the TLB walks, or with
+ *   --events l3 the run 3 events plus the L2 demand read hits, the L3 read
+ *   accesses and the L3 demand read hits.
  * --cme: the same chase through the CME (cme_kern.S: LD1D then LASTB in
  *   streaming mode), so every load takes the core -> CME -> core path. The
  *   first row, "cme-roundtrip", is a DUP then LASTB chain with no memory
@@ -78,6 +80,7 @@ static uint64_t xorshift64(void)
 static int sparse; /* --sparse: one member line per 4 KiB page per chain (1), --sparse-vary: the line varies per page (2) */
 static int seq;    /* --seq: the chain is the lines in address order */
 static int ev_tlb; /* --events tlb: the translation counter set instead of the prefetch set */
+static int ev_l3;  /* --events l3: the L2 and L3 hit counter set instead of the prefetch set */
 #define LINES_PER_PAGE (4096 / LINE_BYTES)
 
 /* Line index of member k of chain `slot`: every line in order, or one line per
@@ -326,7 +329,7 @@ static void usage(void)
     fprintf(stderr,
             "usage: latency --sizes a,b,c [--cpu N] [--mem dram|ocm|spm] [--ocm-regions 0,1,..]\n"
             "               [--loads N] [--reps R] [--fresh K] [--flush] [--sparse | --sparse-vary] [--seq]\n"
-            "               [--perf] [--events prefetch|tlb] [--cme] [--no-hugetlb] [--no-thp]\n"
+            "               [--perf] [--events prefetch|tlb|l3] [--cme] [--no-hugetlb] [--no-thp]\n"
             "               [--ocm-dev P --ocm-base A --ocm-stride S --ocm-size B] [--spm-dev P --spm-off O]\n"
             "  sizes accept K/M/G suffixes. --mem ocm splits each size evenly over the listed regions.\n"
             "  --fresh K (2..8): K chains per line, time one pass over each of chains 1..K-1.\n"
@@ -336,6 +339,7 @@ static void usage(void)
             "  --sparse-vary: as --sparse, with the member's line changing from page to page.\n"
             "  --seq: the chain is the lines in address order (a prefetch stimulus for the prefetch counters).\n"
             "  --events tlb: count the TLB refills and walks instead of the prefetch refills (core sets only).\n"
+            "  --events l3: count the L2 and L3 demand read hits and the L3 read accesses instead (core sets only).\n"
             "  --cme: chase through the CME in streaming mode (needs SME2, SVL 64 B); adds a cme-roundtrip row.\n");
     exit(2);
 }
@@ -354,7 +358,12 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--sparse")) sparse = 1;
         else if (!strcmp(a, "--sparse-vary")) sparse = 2;
         else if (!strcmp(a, "--seq")) seq = 1;
-        else if (!strcmp(a, "--events") && more) { const char *e = argv[++i]; if (!strcmp(e, "tlb")) ev_tlb = 1; else if (strcmp(e, "prefetch")) usage(); }
+        else if (!strcmp(a, "--events") && more) {
+            const char *e = argv[++i];
+            if (!strcmp(e, "tlb")) ev_tlb = 1;
+            else if (!strcmp(e, "l3")) ev_l3 = 1;
+            else if (strcmp(e, "prefetch")) usage();
+        }
         else if (!strcmp(a, "--perf")) cfg.use_perf = 1;
         else if (!strcmp(a, "--cpu") && more) cfg.cpu = atoi(argv[++i]);
         else if (!strcmp(a, "--loads") && more) cfg.loads = parse_bytes(argv[++i]);
@@ -377,12 +386,13 @@ int main(int argc, char **argv)
     if (cfg.use_perf) {
         if (use_cme) perf_open_cme(&pg);
         else if (ev_tlb) perf_open_tlb(&pg);
+        else if (ev_l3) perf_open_l3(&pg);
         else perf_open(&pg);
     }
 
     printf("# latency: ns_per_load = elapsed_ns / loads; cpu=%d mem=%s cntfrq_hz=%llu loads=%llu reps=%d fresh=%d flush=%d sparse=%d seq=%d cme=%d events=%s\n",
            cfg.cpu, mem_name(cfg.kind), (unsigned long long)read_cntfrq(), (unsigned long long)cfg.loads,
-           cfg.reps, cfg.fresh, cfg.flush, sparse, seq, use_cme, use_cme ? "cme" : ev_tlb ? "tlb" : "prefetch");
+           cfg.reps, cfg.fresh, cfg.flush, sparse, seq, use_cme, use_cme ? "cme" : ev_tlb ? "tlb" : ev_l3 ? "l3" : "prefetch");
     printf("mem,size_bytes,mode,rep,loads,ns_per_load");
     if (pg.ok) {
         for (int i = 0; i < PERF_N; i++)
