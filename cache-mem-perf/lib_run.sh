@@ -29,6 +29,7 @@ LOG="$OUT/log.txt"
 [ "$DRY" = 1 ] && LOG=/dev/null
 LAT="$HERE/latency"
 BW="$HERE/bandwidth"
+BW2="$HERE/bandwidth_r2"   # run 2's bandwidth program, the control of run_followup.sh phase G5
 CMN="$HERE/cmncount"
 CMNOUT="$OUT/cmn-counts.csv"
 [ -x "$LAT" ] && [ -x "$BW" ] && [ -x "$CMN" ] || { echo "build first: make" >&2; exit 2; }

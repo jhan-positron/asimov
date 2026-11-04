@@ -221,18 +221,25 @@ static inline uint64_t read_cntfrq(void)
 #endif
 }
 
-/* ---- perf counters: cycles + L1D, L2D, L3D refills, one group ---- */
-#define PERF_N 4
+/* ---- perf counters: cycles + six raw events, one group. The C1-Nano PMU has 6 or 20 event
+ * counters (TRM, "Number of PMU event counters"); cycles take the dedicated cycle counter, so
+ * six raw events fit either size, as long as nothing else holds a counter (perf_cov catches
+ * the case where something does). The CRB (Neoverse V3AE) exposes 6 + cycles. ---- */
+#define PERF_N 7
+#define PERF_REQUIRED 4   /* the run 3 set: cycles and three refill events; the rest are optional */
 struct perfgrp {
     int fd[PERF_N];
+    int pos[PERF_N];          /* position of event i in the group read (the open events in order), or -1 when refused */
     int ok;
+    int n;                    /* events open: PERF_N, or fewer when optional events were refused */
     const char *const *names; /* column names of the open set */
     int ctl_err;              /* errno of the last failed reset/enable/disable ioctl, else 0 */
     uint64_t t_enabled, t_running; /* ns, this row: the change since the previous read (the kernel keeps
                                       the lifetime totals across PERF_EVENT_IOC_RESET, which resets counts only) */
     uint64_t prev_enabled, prev_running; /* lifetime totals at the previous read, the baseline of the next row */
 };
-static const char *perf_name[PERF_N] = { "cycles", "l1d_refill", "l2d_refill", "l3d_refill_rd" };
+static const char *perf_name[PERF_N] = { "cycles", "l1d_refill", "l2d_refill", "l3d_refill_rd", "l1d_refill_hwprf", "l2d_refill_hwprf", "l2d_refill_l1dhwprf" };
+static const char *perf_name_tlb[PERF_N] = { "cycles", "l1d_refill", "l2d_refill", "l3d_refill_rd", "l1d_tlb_refill", "l2d_tlb_refill", "dtlb_walk" };
 
 static inline int perf_open_one(struct perf_event_attr *a, int group)
 {
@@ -250,8 +257,15 @@ static inline int perf_open_one(struct perf_event_attr *a, int group)
  *   0x3246 CME_CYCLES              clock cycles of the CME (its own clock, not the timer)
  *   0x327D CME_L1D_CACHE_REFILL_INNER  CME L1 refills whose data came from a cache inside the cluster (the DSU L3)
  *   0x327E CME_L1D_CACHE_REFILL_OUTER  CME L1 refills whose data came from outside the cluster (SLC, OCM, DRAM)
- * A load that hit the CME L1 counts in neither refill event. */
-static const char *perf_name_cme[PERF_N] = { "cycles", "cme_cycles", "cme_l1d_refill_inner", "cme_l1d_refill_outer" };
+ *   0x3280 CME_L1D_CACHE_REFILL_RD     CME L1 refills caused by a load that missed
+ *   0x32B2 CME_L1D_CACHE_REFILL_HWPRF  CME L1 refills caused by the CME's hardware prefetcher
+ *   0x3281 CME_L1D_CACHE_REFILL_WR     CME L1 refills caused by a store that missed (none expected: the chase has no stores)
+ * A load that hit the CME L1 counts in no refill event. INNER + OUTER is every refill. The TRM
+ * lists four causes (RD, WR, HWPRF and 0x32B1 software preload); the chase kernel has no stores
+ * and no preloads, so for it RD + HWPRF should equal INNER + OUTER. That is a consistency
+ * hypothesis for this kernel, checked per load, not a TRM identity. "Inner" means a cache inside
+ * the immediate cluster of the core; on Asimov that is the DSU's L3 or the other core's caches. */
+static const char *perf_name_cme[PERF_N] = { "cycles", "cme_cycles", "cme_l1d_refill_inner", "cme_l1d_refill_outer", "cme_l1d_refill_rd", "cme_l1d_refill_hwprf", "cme_l1d_refill_wr" };
 
 static inline void perf_open_set(struct perfgrp *g, const uint64_t raw[PERF_N], const char *const names[PERF_N])
 {
@@ -266,6 +280,8 @@ static inline void perf_open_set(struct perfgrp *g, const uint64_t raw[PERF_N], 
         printf("# perf: unavailable (%s)\n", strerror(errno));
         return;
     }
+    g->n = 1;
+    g->pos[0] = 0;
     for (int i = 1; i < PERF_N; i++) {
         memset(&a, 0, sizeof a);
         a.type = PERF_TYPE_RAW;
@@ -274,23 +290,50 @@ static inline void perf_open_set(struct perfgrp *g, const uint64_t raw[PERF_N], 
         if (g->fd[i] < 0) {
             printf("# perf: event %s (raw 0x%llx) unavailable (%s)\n", names[i],
                    (unsigned long long)raw[i], strerror(errno));
-            return;
+            if (i < PERF_REQUIRED)
+                return;
+            g->pos[i] = -1; /* an optional event: its column prints "-"; the events after it are still tried */
+            continue;
         }
+        g->pos[i] = g->n++;
     }
     g->ok = 1;
 }
 
+/* Whether event i of the group is open (its column is a number, not "-"). */
+static inline int perf_have(const struct perfgrp *g, int i)
+{
+    return g->ok && g->pos[i] >= 0;
+}
+
 static inline void perf_open(struct perfgrp *g)
 {
-    /* Arm PMU events: 0x03 L1D_CACHE_REFILL, 0x17 L2D_CACHE_REFILL, 0xA2 L3D_CACHE_REFILL_RD.
-     * Not 0x2A: the C1-Nano opens it without error but it always reads 0 (Jesse, 2026-10-30). */
-    static const uint64_t raw[PERF_N] = { 0, 0x03, 0x17, 0xA2 };
+    /* Arm PMU events (C1-Nano TRM event list): 0x03 L1D_CACHE_REFILL (refills caused by the
+     * program's loads and stores), 0x17 L2D_CACHE_REFILL (every L2 refill: data and instruction
+     * misses, translation walks, L1 write-backs, prefetches), 0xA2 L3D_CACHE_REFILL_RD (L3 fills
+     * from outside due to a read), 0x81BC L1D_CACHE_REFILL_HWPRF (L1D refills a hardware
+     * prefetcher requested), 0x81BD L2D_CACHE_REFILL_HWPRF (L2 refills by prefetchers targeting
+     * L2) and 0x0111 IMP_L2D_CACHE_REFILL_L1DHWPRF (L2 refills by the L1D prefetcher's requests).
+     * The three prefetch events are reported as their own rates; 0x17 minus them is "L2 refills
+     * not accounted for by these events", not a demand count. Not 0x2A: the C1-Nano opens it
+     * without error but it always reads 0 (Jesse, 2026-10-30). Whether an event counts on the
+     * emulator is shown by its counts on a stimulus where its activity is established, not by the open succeeding. */
+    static const uint64_t raw[PERF_N] = { 0, 0x03, 0x17, 0xA2, 0x81BC, 0x81BD, 0x0111 };
     perf_open_set(g, raw, perf_name);
+}
+
+/* The translation set (--events tlb): the run 3 refill events plus 0x05 L1D_TLB_REFILL,
+ * 0x2D L2D_TLB_REFILL and 0x34 DTLB_WALK (C1-Nano TRM event list). 0x05 counts refills caused by
+ * hardware prefetches too (TRM), so it is translation activity, not demand misses only. */
+static inline void perf_open_tlb(struct perfgrp *g)
+{
+    static const uint64_t raw[PERF_N] = { 0, 0x03, 0x17, 0xA2, 0x05, 0x2D, 0x34 };
+    perf_open_set(g, raw, perf_name_tlb);
 }
 
 static inline void perf_open_cme(struct perfgrp *g)
 {
-    static const uint64_t raw[PERF_N] = { 0, 0x3246, 0x327D, 0x327E };
+    static const uint64_t raw[PERF_N] = { 0, 0x3246, 0x327D, 0x327E, 0x3280, 0x32B2, 0x3281 };
     perf_open_set(g, raw, perf_name_cme);
 }
 
@@ -308,13 +351,15 @@ static inline int perf_read(struct perfgrp *g, uint64_t out[PERF_N], const char 
     memset(out, 0, sizeof(uint64_t) * PERF_N);
     *why = NULL;
     if (!g->ok) { *why = "group not open"; return 0; }
-    if (read(g->fd[0], v, sizeof v) != (ssize_t)sizeof v) { *why = "short read"; return 0; }
-    if (v[0] != PERF_N) { *why = "wrong event count"; return 0; }
+    size_t want = sizeof(uint64_t) * (3 + (size_t)g->n);
+    if (read(g->fd[0], v, want) != (ssize_t)want) { *why = "short read"; return 0; }
+    if (v[0] != (uint64_t)g->n) { *why = "wrong event count"; return 0; }
     g->t_enabled = v[1] - g->prev_enabled;
     g->t_running = v[2] - g->prev_running;
     g->prev_enabled = v[1];
     g->prev_running = v[2];
-    memcpy(out, v + 3, sizeof(uint64_t) * PERF_N);
+    for (int i = 0; i < PERF_N; i++)
+        out[i] = g->pos[i] >= 0 ? v[3 + g->pos[i]] : 0; /* a refused event reads as 0; print_counters prints "-" for it */
     if (g->ctl_err) { *why = "counter ioctl failed"; return 0; }
     if (g->t_running == 0 || g->t_running != g->t_enabled) { *why = "multiplexed"; return 0; } /* ran for part of the row */
     return 1;

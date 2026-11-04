@@ -97,6 +97,25 @@ results:
   complete-call time divided by its hop count; the `lines=` value in the size
   line is then the members per chain. A 64-hop pass has a timing step of
   1/64 ns per 1 ns of clock step and a counter step of 1/64 per event.
+- Vary chain (`--sparse-vary`): the sparse chain with the member's line changing
+  from page to page (a hash of the page number picks the slot and the line;
+  chains never share a line). Run 3's sparse rows counted fewer L3 read
+  refills per load than run 2's dense rows (best pass of each of the 20
+  CPU-region cells: 0.50 to 0.86 against 0.76 to 0.92). One reading, a
+  hypothesis, is that a prefetcher lands on sparse members by carrying the fixed
+  line offset from page to page; this chain tests the sensitivity to that
+  offset. A difference between the two chains identifies the offset pattern as
+  a factor, not which prefetcher reacts to it.
+- Sequential chain (`--seq`): the lines in address order, a chain a stride
+  prefetcher can run ahead of. It is the candidate stimulus for validating the
+  prefetch refill events: each event is validated separately, on a boot with
+  the prefetchers enabled, when the activity it counts is established on this
+  row; an event that stays zero without such evidence is unvalidated, not
+  broken. On a prefetch-disabled boot the register readbacks and the previously
+  validated counts assess the change; the latency change is reported as an
+  outcome, with no required direction and no required equality with the random
+  chain.
+
 - Flushed: every line of the buffer is cleaned and invalidated from L1, L2 and
   L3 (`DC CIVAC` + `DSB SY`) before the timed pass. For a DRAM-backed buffer this
   also removes the lines from the SLC (run 1: flushed rows read the DRAM
@@ -113,11 +132,14 @@ results:
 | File | What it is |
 |---|---|
 | `common.h` | buffers in DRAM (MAP_HUGETLB, else THP, or 4 KiB pages with `--no-thp`), OCM regions, SPM; flush; core perf counters |
-| `latency.c` | single-thread pointer chase; `--fresh`, `--flush`, `--perf` |
+| `latency.c` | single-thread pointer chase; `--fresh`, `--flush`, `--sparse`, `--sparse-vary`, `--seq`, `--perf`, `--events` |
 | `bandwidth.c` | pinned threads, read / write / copy with `ldp`/`stp` q-register pairs; `ldr16`/`str16` for SPM |
+| `bandwidth_r2.c` | run 2's bandwidth.c (commit 8ae533c) kept verbatim, built as `bandwidth_r2`: the control of run_followup.sh phase G5 for the per-pass write cost that run 3 added |
 | `cmncount.c` | runs one command with mesh PMU events open (system-wide, on the PMU's CPU), appends one CSV line per event and one with the command's lifetime |
 | `cme_kern.S` | the chase and the read / write / copy loops again as streaming-mode SVE (`LD1D` + `LASTB`; `LD1B` / `ST1B` of four vectors and of one), used by `latency --cme` and `bandwidth --cme`; plus the register round trip and `RDSVL` |
 | `cme_test.c` | self-test of those kernels on any SME2 machine: chase, round trip, read fold, write pattern, copy; `make cme_test && ./cme_test` |
+| `run_followup.sh` | the run 3 follow-up (follow-up-run-plan.md): the OCM chase rows dense, sparse and vary from CPUs 2 and 8, the TLB counter set on the CPU 2 rows with its own validation row, the CME latency sweep, and a sequential chain as the prefetch stimulus, all with the prefetch-refill counters, plus the small one-core write rows with run 3's and run 2's bandwidth programs (G5) and the 20 dense OCM cells under the crosspoint flit counters (G6); meant to run once per boot (normal, prefetchers off, larger OCM pages, both) |
+| `test_lat_rows.py` | test of the latency CSV reader in gen_run3.py over run 2, run 3 and run 4 row shapes, refused and invalid counters; `python3 test_lat_rows.py` |
 | `perf_cov_test.c` | host test that a multiplexed counter row is rejected and the next row is not; `make perf_cov_test && taskset -c 2 ./perf_cov_test` on an Arm machine |
 | `est_chip_time.py` | sizes a run from `sh run_asimov.sh --dry-run`: exact counts per command, labelled time assumptions |
 | `run_all.sh` | **the script to run**: the cache and mesh test, then the CME test, into one `results/<UTC time>/` directory |
@@ -228,17 +250,37 @@ the untimed warm-up pass absorbs.
 `latency` prints one CSV row per timed walk:
 
 ```
-mem,size_bytes,mode,rep,loads,ns_per_load,cycles_per_load,l1d_refill_per_load,l2d_refill_per_load,l3d_refill_rd_per_load
-dram,4096,repeat,0,65536,2.003,4.01,0.0003,0.0002,0.0002
+mem,size_bytes,mode,rep,loads,ns_per_load,cycles_per_load,l1d_refill_per_load,l2d_refill_per_load,l3d_refill_rd_per_load,l1d_refill_hwprf_per_load,l2d_refill_hwprf_per_load,l2d_refill_l1dhwprf_per_load,perf_cov
+dram,4096,repeat,0,65536,2.003,4.01,0.0003,0.0002,0.0002,0.0000,0.0000,0.0000,1.0000
 ```
 
-`ns_per_load` is the latency. The refill columns come from the Arm PMU events
-0x03 (L1D refill), 0x17 (L2D refill) and 0xA2 (L3D refill on reads) around the
-timed walk, divided by the number of loads. 0xA2 is used instead of 0x2A because
-the C1-Nano opens 0x2A without error but it always reads 0 (Jesse, 2026-10-30).
-A level with about 1.0 refills per load is the one that missed. A `best` row
-per size carries the minimum. In `--fresh 3` mode the timed rows are `fresh1`
-and `fresh2`, one pass each over a chain that was never walked.
+`ns_per_load` is the latency. The refill columns come from Arm PMU events
+counted around the timed walk and divided by the number of loads. The first
+three are run 2's: 0x03 L1D_CACHE_REFILL (L1 refills the program's own loads and
+stores caused), 0x17 L2D_CACHE_REFILL (every L2 refill: data and instruction
+misses, translation walks, L1 write-backs and prefetches) and 0xA2
+L3D_CACHE_REFILL_RD (L3 fills from outside due to a read). 0xA2 is used instead
+of 0x2A because the C1-Nano opens 0x2A without error but it always reads 0
+(Jesse, 2026-10-30). Since the run 3 follow-up the default set adds three
+hardware-prefetch refill events: 0x81BC L1D_CACHE_REFILL_HWPRF, 0x81BD
+L2D_CACHE_REFILL_HWPRF (prefetchers targeting L2) and 0x0111
+IMP_L2D_CACHE_REFILL_L1DHWPRF (the L1D prefetcher's requests). Each is its own
+rate; the L2 column minus the two L2 prefetch columns is "L2 refills not
+accounted for by these events", not a demand count. `--events tlb` swaps the
+three prefetch events for 0x05 L1D_TLB_REFILL (which also counts refills that
+prefetches caused), 0x2D L2D_TLB_REFILL and 0x34 DTLB_WALK; the header names
+the columns. A level with about 1.0 refills per load is the one that filled one
+line per load. The events after the first three are optional: if the kernel
+refuses one, the row prints `-` in that column and keeps the others (a `# perf:
+event ... unavailable` line says so once per file). An event can also open and
+never count (on the CRB 0x81BC, 0x81BD and 0x0111 read 0 on a `--seq` chain
+that some prefetcher plainly sped up); the `--seq` chain is the stimulus on
+which each event is validated separately, and an event that stays zero on it
+is unvalidated rather than broken. A
+nonzero count too small for four decimals prints in exponent form (`4.6e-05`),
+so `0.0000` is an exact zero. A `best` row per size carries the minimum. In
+`--fresh 3` mode the timed rows are `fresh1` and `fresh2`, one pass each over a
+chain that was never walked.
 
 The last counter column, `perf_cov`, is the group's running time over its
 enabled time; 1.0000 means the counters covered the whole walk. When they did
@@ -247,8 +289,14 @@ short, or the kernel multiplexed the group), the row prints `-` in every
 counter column and a `# perf: counters of the row above are invalid: <reason>`
 line follows it. The timing of such a row is still valid; its cache
 attribution is not. With `--cme` the counter columns are
-`cme_cycles_per_load`, `cme_l1d_refill_inner_per_load` and
-`cme_l1d_refill_outer_per_load` (events 0x3246, 0x327D, 0x327E), and the first
+`cme_cycles_per_load`, `cme_l1d_refill_inner_per_load`,
+`cme_l1d_refill_outer_per_load`, `cme_l1d_refill_rd_per_load`,
+`cme_l1d_refill_hwprf_per_load` and `cme_l1d_refill_wr_per_load` (events
+0x3246, 0x327D, 0x327E, 0x3280, 0x32B2, 0x3281: inner plus outer is every CME
+L1 refill, by where the data came from; rd, hwprf and wr are refills by cause,
+a load that missed, the CME prefetcher, a store that missed. The TRM also lists
+software preloads; the chase has none, so rd plus hwprf equalling inner plus
+outer is a consistency check for this kernel, not an identity), and the first
 rows of the file are the `cme-roundtrip` control with `size_bytes` 0, then
 the `cme-call` rows: 64 complete one-hop calls timed together, per call
 (`loads` 64). A call holds the register save, `SMSTART`, one register hop,

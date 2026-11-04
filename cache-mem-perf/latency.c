@@ -29,14 +29,33 @@
  *   still lands on a member is not something the counters can rule out. A
  *   sparse chain has bytes / 4096 hops, so --fresh 8 gives seven timed passes,
  *   each a complete-call time divided by its hop count.
- * --perf: cycles and L1D/L2D/L3D refills are counted around each timed walk
- *   and printed per load, so each latency step can be attributed to a level.
+ * --sparse-vary: as --sparse, but the member's line within the page also changes
+ *   from page to page (a hash of the page number picks one of 8 slots of 8 lines
+ *   for each chain, and a line within the slot; chains never share a line). Run 3's
+ *   sparse rows counted fewer L3 read refills per load than run 2's dense rows
+ *   (best pass of each of the 20 CPU-region cells: 0.50 to 0.86 against 0.76 to
+ *   0.92). One reading (a hypothesis) is that a prefetcher lands on sparse members
+ *   by carrying the one fixed line offset from page to page; this chain tests the
+ *   sensitivity to that offset. It does not by itself name the prefetcher.
+ * --seq: the chain visits the lines in address order instead of a random cycle
+ *   (member i points to member i + 1). A candidate prefetch stimulus for the
+ *   prefetch counters: a stride prefetcher can run ahead of it. Each event is
+ *   validated separately, on a boot with the prefetchers enabled, when the
+ *   activity it counts is established; an event that stays zero without such
+ *   evidence is unvalidated, not broken. On a prefetch-disabled boot the
+ *   readbacks and the previously validated counts assess the change; the
+ *   latency change is reported as an outcome, with no required direction.
+ * --perf: cycles and six raw events are counted around each timed walk and
+ *   printed per load (common.h names the sets): the run 3 refill events plus
+ *   the three hardware-prefetch refill events, or with --events tlb the run 3
+ *   events plus the L1D and L2D TLB refills and the TLB walks.
  * --cme: the same chase through the CME (cme_kern.S: LD1D then LASTB in
  *   streaming mode), so every load takes the core -> CME -> core path. The
  *   first row, "cme-roundtrip", is a DUP then LASTB chain with no memory
  *   access: a control with the same register return path, not a measured
  *   part of a chase hop. --perf then counts the CME set (cycles, CME_CYCLES,
- *   CME L1 refills from inside the cluster, from outside the cluster).
+ *   CME L1 refills from inside the cluster, from outside the cluster, by reads,
+ *   by the CME's hardware prefetcher).
  * Counter columns: a row prints "-" for every counter, and a "# perf:" line
  *   with the reason, when the group did not count the whole walk (open
  *   failure, ioctl failure, short read, multiplexing). The timing stays valid.
@@ -56,26 +75,40 @@ static uint64_t xorshift64(void)
     return rng_state;
 }
 
-static int sparse; /* --sparse: one member line per 4 KiB page per chain */
+static int sparse; /* --sparse: one member line per 4 KiB page per chain (1), --sparse-vary: the line varies per page (2) */
+static int seq;    /* --seq: the chain is the lines in address order */
+static int ev_tlb; /* --events tlb: the translation counter set instead of the prefetch set */
 #define LINES_PER_PAGE (4096 / LINE_BYTES)
 
 /* Line index of member k of chain `slot`: every line in order, or one line per
- * page at an offset that differs per chain. */
+ * page at an offset that differs per chain (line 8 slot + 4), or (--sparse-vary)
+ * one line per page in slot (slot + h) mod 8 at line h' of that slot, where h and
+ * h' are bits of a hash of the page number. Chains differ in slot, so no two chains
+ * share a line in any mode. */
 static uint64_t member_line(uint64_t k, int slot)
 {
-    return sparse ? k * LINES_PER_PAGE + 8 * (uint64_t)slot + 4 : k;
+    if (!sparse)
+        return k;
+    uint64_t s = (uint64_t)slot, off = 4;
+    if (sparse == 2) {
+        uint64_t h = (k + 1) * 0x9E3779B97F4A7C15ULL;
+        s = (s + (h >> 61)) & 7;
+        off = (h >> 58) & 7;
+    }
+    return k * LINES_PER_PAGE + 8 * s + off;
 }
 
 /* First the identity, then a Sattolo shuffle of member indices, then index ->
  * address. Word `slot` of each member line carries this chain and the stored
- * pointer targets the same slot of the next member, so chase() needs no offset. */
+ * pointer targets the same slot of the next member, so chase() needs no offset.
+ * With --seq the shuffle is skipped and member i points to member i + 1. */
 static void build_cycle(const struct buf *b, uint64_t n, int slot, uint64_t seed)
 {
 #define AT(i) (*(uint64_t *)(line_addr(b, member_line((i), slot)) + (slot) * 8))
     rng_state = seed;
     for (uint64_t i = 0; i < n; i++)
-        AT(i) = i;
-    for (uint64_t i = n - 1; i > 0; i--) {
+        AT(i) = seq ? (i + 1) % n : i;
+    for (uint64_t i = n - 1; i > 0 && !seq; i--) {
         uint64_t j = xorshift64() % i;
         uint64_t tmp = AT(i);
         AT(i) = AT(j);
@@ -127,15 +160,29 @@ static struct perfgrp pg;
 /* The counter columns of one row: per-load values and the coverage
  * (time_running / time_enabled, 1.0000 when the group counted the whole
  * walk), or "-" in every column and a comment line with the reason. */
+static void print_per_load(uint64_t count, uint64_t loads)
+{
+    double v = (double)count / (double)loads;
+    if (count != 0 && v < 0.00005)
+        printf(",%.3e", v); /* a count that %.4f would print as 0.0000: keep it distinct from an exact zero */
+    else
+        printf(",%.4f", v);
+}
+
 static void print_counters(const uint64_t c[PERF_N], uint64_t loads, int valid, const char *why)
 {
     if (pg.ok) {
-        if (valid)
-            printf(",%.2f,%.4f,%.4f,%.4f,%.4f", (double)c[0] / (double)loads, (double)c[1] / (double)loads,
-                   (double)c[2] / (double)loads, (double)c[3] / (double)loads,
-                   (double)pg.t_running / (double)pg.t_enabled);
-        else
-            printf(",-,-,-,-,-");
+        if (valid) {
+            printf(",%.2f", (double)c[0] / (double)loads);
+            for (int i = 1; i < PERF_N; i++) {
+                if (perf_have(&pg, i)) print_per_load(c[i], loads);
+                else printf(",-"); /* an optional event this kernel refused to open */
+            }
+            printf(",%.4f", (double)pg.t_running / (double)pg.t_enabled);
+        } else {
+            for (int i = 0; i <= PERF_N; i++)
+                printf(",-");
+        }
     }
     printf("\n");
     if (pg.ok && !valid)
@@ -278,13 +325,17 @@ static void usage(void)
 {
     fprintf(stderr,
             "usage: latency --sizes a,b,c [--cpu N] [--mem dram|ocm|spm] [--ocm-regions 0,1,..]\n"
-            "               [--loads N] [--reps R] [--fresh K] [--flush] [--sparse] [--perf] [--cme] [--no-hugetlb] [--no-thp]\n"
+            "               [--loads N] [--reps R] [--fresh K] [--flush] [--sparse | --sparse-vary] [--seq]\n"
+            "               [--perf] [--events prefetch|tlb] [--cme] [--no-hugetlb] [--no-thp]\n"
             "               [--ocm-dev P --ocm-base A --ocm-stride S --ocm-size B] [--spm-dev P --spm-off O]\n"
             "  sizes accept K/M/G suffixes. --mem ocm splits each size evenly over the listed regions.\n"
             "  --fresh K (2..8): K chains per line, time one pass over each of chains 1..K-1.\n"
             "  --flush: DC CIVAC the buffer before each timed pass; the pass is one cycle.\n"
             "  --sparse: one member line per 4 KiB page per chain (sizes in multiples of 8 KiB), so a\n"
             "    prefetched neighbour is never a member; a pass is bytes/4096 hops, use --fresh 8.\n"
+            "  --sparse-vary: as --sparse, with the member's line changing from page to page.\n"
+            "  --seq: the chain is the lines in address order (a prefetch stimulus for the prefetch counters).\n"
+            "  --events tlb: count the TLB refills and walks instead of the prefetch refills (core sets only).\n"
             "  --cme: chase through the CME in streaming mode (needs SME2, SVL 64 B); adds a cme-roundtrip row.\n");
     exit(2);
 }
@@ -301,6 +352,9 @@ int main(int argc, char **argv)
         if (!strcmp(a, "--flush")) cfg.flush = 1;
         else if (!strcmp(a, "--cme")) use_cme = 1;
         else if (!strcmp(a, "--sparse")) sparse = 1;
+        else if (!strcmp(a, "--sparse-vary")) sparse = 2;
+        else if (!strcmp(a, "--seq")) seq = 1;
+        else if (!strcmp(a, "--events") && more) { const char *e = argv[++i]; if (!strcmp(e, "tlb")) ev_tlb = 1; else if (strcmp(e, "prefetch")) usage(); }
         else if (!strcmp(a, "--perf")) cfg.use_perf = 1;
         else if (!strcmp(a, "--cpu") && more) cfg.cpu = atoi(argv[++i]);
         else if (!strcmp(a, "--loads") && more) cfg.loads = parse_bytes(argv[++i]);
@@ -322,12 +376,13 @@ int main(int argc, char **argv)
         require_cme();
     if (cfg.use_perf) {
         if (use_cme) perf_open_cme(&pg);
+        else if (ev_tlb) perf_open_tlb(&pg);
         else perf_open(&pg);
     }
 
-    printf("# latency: ns_per_load = elapsed_ns / loads; cpu=%d mem=%s cntfrq_hz=%llu loads=%llu reps=%d fresh=%d flush=%d sparse=%d cme=%d\n",
+    printf("# latency: ns_per_load = elapsed_ns / loads; cpu=%d mem=%s cntfrq_hz=%llu loads=%llu reps=%d fresh=%d flush=%d sparse=%d seq=%d cme=%d events=%s\n",
            cfg.cpu, mem_name(cfg.kind), (unsigned long long)read_cntfrq(), (unsigned long long)cfg.loads,
-           cfg.reps, cfg.fresh, cfg.flush, sparse, use_cme);
+           cfg.reps, cfg.fresh, cfg.flush, sparse, seq, use_cme, use_cme ? "cme" : ev_tlb ? "tlb" : "prefetch");
     printf("mem,size_bytes,mode,rep,loads,ns_per_load");
     if (pg.ok) {
         for (int i = 0; i < PERF_N; i++)
