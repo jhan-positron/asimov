@@ -340,8 +340,9 @@ CME form) runs all `--passes` passes of a rep inside one assembly call, so a
 rep pays one call, one return and one save of the callee-saved vector
 registers instead of one per pass. The inner loop's exit still runs once per
 pass. The header line records it as `asm_passes=1`. The default form and this
-form at the same size give the call-and-return part of the per-pass cost
-(run_followup.sh G8).
+form at the same size give the net cost of the default pass machinery (call,
+return, register save, the per-pass dispatch and accounting) against the
+assembly's own loop step (run_followup.sh G8).
 
 `cmncount` appends to `cmn-counts.csv`:
 

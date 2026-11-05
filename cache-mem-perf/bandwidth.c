@@ -24,8 +24,10 @@
  *   buffer --passes times inside one assembly call, so a rep has one call, one
  *   return and one save of d8-d15 instead of one per pass. The inner loop
  *   still falls through once per pass (mov, subs, b.ne). The default form
- *   pays the call, return and save at every pass boundary; the two forms
- *   together measure that part of the per-pass cost.
+ *   also runs pass()'s segment loop, dispatch and byte accounting and the C
+ *   loop's step at every pass. The two forms together measure the net cost
+ *   of that machinery against the assembly's own loop step, not the call
+ *   and return alone.
  * --flush-before: DC CIVAC the buffer before each timed rep, so reads come
  *   from the home node (OCM / SLC), not from L1/L2/L3.
  * --flush-after: DC CIVAC inside the timed region after the passes, so a
@@ -165,8 +167,8 @@ __attribute__((noinline)) static void k_write(uint8_t *p, uint64_t bytes, uint64
 
 /* --asm-passes: the read and write loops with the pass loop inside the assembly. The inner loop is
  * the k_read / k_write body; the outer loop resets the pointer and counts `passes` down. A rep then
- * has one call and one return; the inner loop's fall-through, the subs and the taken b.ne remain
- * once per pass. */
+ * has one call and one return. The inner loop's fall-through, the subs and the taken b.ne remain
+ * once per pass. k_write_n saves no vector registers in either form: it clobbers only v0. */
 __attribute__((noinline)) static void k_read_n(const uint8_t *p, uint64_t bytes, uint64_t passes)
 {
     const uint8_t *end = p + bytes;

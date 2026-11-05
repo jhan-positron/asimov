@@ -107,7 +107,8 @@ def bandwidth_cmd(args):
         per_pass = size * mult * threads
         r["warm_bytes"] += reps * per_pass
         r["timed_bytes"] += reps * passes * per_pass
-        r["calls"] += reps * (passes + 1) * threads * nseg
+        # --asm-passes: the timed passes are one kernel call per rep (the warm-up pass still calls per segment)
+        r["calls"] += reps * (1 + (1 if "--asm-passes" in args else passes)) * threads * nseg
         if flush_before:
             r["civac"] += reps * size * threads // 64
         # read-pf4/8/16 and read-2s are costed at the plain read rate (est.): a faster read only shortens them
