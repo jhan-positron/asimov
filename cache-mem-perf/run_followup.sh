@@ -54,7 +54,14 @@
 #   G7  read variants the one-core read rows at 2 MiB and 32 MiB with the plain read loop, with a
 #                     software prefetch 4, 8 and 16 lines ahead, and over two streams, each under
 #                     the prefetch counters: whether the hardware prefetcher runs on a streaming read
-# No bandwidth rows beyond G5 and G7; the mesh counters are used only in G6.
+#   G8  L1 pass cost  the one-core read and write rows at 4, 8, 16 and 24 KiB (inside the 32 KiB L1),
+#                     each in two forms: the default, one kernel call per pass, and --asm-passes, all
+#                     passes inside one call. Time per pass against size, fitted per form, gives the
+#                     per-pass cost (intercept) and the L1 rate without it (slope); the two intercepts
+#                     split the cost into call, return and register save (their difference) and the
+#                     loop exit (the --asm-passes intercept). Under the prefetch counters, so the L1
+#                     refills per line show the buffer stayed in the L1
+# No bandwidth rows beyond G5, G7 and G8; the mesh counters are used only in G6.
 # Chip time: `sh run_followup.sh --dry-run | python3 est_chip_time.py` (est.; see the plan).
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -259,6 +266,25 @@ for sp in 2M:4 32M:2; do
     s=${sp%%:*}; p=${sp##*:}
     for k in read read-pf4 read-pf8 read-pf16 read-2s; do
         run bandwidth-read-prefetch.csv "$BW" --threads 1 --cpus $CPU --bytes $s --kernel $k --passes $p --reps 3 --perf
+    done
+    [ "$QUICK" = 1 ] && break
+done
+
+# ---- G8. the L1 rows: per-pass cost by size, and with the pass loop inside the assembly ----
+# Run 3's 16 KiB read row (58.1 GB/s) is 91 % of the core's two 128-bit load pipes at 2 GHz (64 GB/s).
+# A 16 KiB pass is 512 cycles of loads; the row reads 564 cycles per pass, 52 cycles over. The boot A
+# write sweep (G5) fits a fixed 21 to 30 ns per pass. Four sizes fit the same line for read and write,
+# and the --asm-passes form removes the call, return and register save from the boundary (one of each
+# per rep; the inner loop's exit stays once per pass), so its own fit gives the loop-exit cost alone. Passes keep about 4 MiB per rep; 5 reps, because on the CRB the --asm-passes
+# read reps split into a fast and a slow group at 16 KiB (best rep at the pipe limit, median 7 % under
+# it, on two cores), and the best rep is the number. 24 KiB is the largest size that fits the 32 KiB
+# 4-way L1 beside the stack and the harness's own lines; 32 KiB would conflict.
+say "## G8. one-core L1 rows, 4 to 24 KiB, per-pass form and --asm-passes form (cpu $CPU)"
+for sp in 4K:1024 8K:512 16K:256 24K:176; do
+    s=${sp%%:*}; p=${sp##*:}
+    for k in read write; do
+        run bandwidth-l1-passes.csv "$BW" --threads 1 --cpus $CPU --bytes $s --kernel $k --passes $p --reps 5 --perf
+        run bandwidth-l1-asmpasses.csv "$BW" --threads 1 --cpus $CPU --bytes $s --kernel $k --passes $p --reps 5 --perf --asm-passes
     done
     [ "$QUICK" = 1 ] && break
 done

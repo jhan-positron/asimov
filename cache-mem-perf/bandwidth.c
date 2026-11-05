@@ -20,6 +20,12 @@
  *   the L1, L2 and L3 refills, the refills by the hardware prefetchers) is
  *   counted around the timed passes of each rep and printed per 64 B line of
  *   data moved, with the coverage column, as latency.c prints them per load.
+ * --asm-passes (read and write, one segment, no --cme): the kernel walks the
+ *   buffer --passes times inside one assembly call, so a rep has one call, one
+ *   return and one save of d8-d15 instead of one per pass. The inner loop
+ *   still falls through once per pass (mov, subs, b.ne). The default form
+ *   pays the call, return and save at every pass boundary; the two forms
+ *   together measure that part of the per-pass cost.
  * --flush-before: DC CIVAC the buffer before each timed rep, so reads come
  *   from the home node (OCM / SLC), not from L1/L2/L3.
  * --flush-after: DC CIVAC inside the timed region after the passes, so a
@@ -43,7 +49,7 @@ static struct {
     int threads, ncpus, cpus[MAX_CPUS];
     uint64_t bytes;
     int run[K_COUNT];
-    int passes, reps, flush_before, flush_after, cme, use_perf;
+    int passes, reps, flush_before, flush_after, cme, use_perf, asm_passes;
     enum mem_kind kind;
     int regions[MAX_SEGS], nregions;
 } cfg = { .threads = 1, .bytes = 1 << 20, .passes = 4, .reps = 3, .kind = MEM_DRAM };
@@ -157,6 +163,45 @@ __attribute__((noinline)) static void k_write(uint8_t *p, uint64_t bytes, uint64
         : [p] "+r"(p) : [end] "r"(end), [v] "r"(v) : "v0", "memory", "cc");
 }
 
+/* --asm-passes: the read and write loops with the pass loop inside the assembly. The inner loop is
+ * the k_read / k_write body; the outer loop resets the pointer and counts `passes` down. A rep then
+ * has one call and one return; the inner loop's fall-through, the subs and the taken b.ne remain
+ * once per pass. */
+__attribute__((noinline)) static void k_read_n(const uint8_t *p, uint64_t bytes, uint64_t passes)
+{
+    const uint8_t *end = p + bytes;
+    const uint8_t *q;
+    __asm__ volatile(
+        "1:\n\t"
+        "mov %[q], %[p]\n\t"
+        "2:\n\t"
+        "ldp q0, q1, [%[q]]\n\t"       "ldp q2, q3, [%[q], #32]\n\t"
+        "ldp q4, q5, [%[q], #64]\n\t"  "ldp q6, q7, [%[q], #96]\n\t"
+        "ldp q8, q9, [%[q], #128]\n\t" "ldp q10, q11, [%[q], #160]\n\t"
+        "ldp q12, q13, [%[q], #192]\n\t" "ldp q14, q15, [%[q], #224]\n\t"
+        "add %[q], %[q], #256\n\t" "cmp %[q], %[end]\n\t" "b.lo 2b\n\t"
+        "subs %[n], %[n], #1\n\t" "b.ne 1b\n\t"
+        : [q] "=&r"(q), [n] "+&r"(passes) : [p] "r"(p), [end] "r"(end) : QCLOBBER);
+}
+
+__attribute__((noinline)) static void k_write_n(uint8_t *p, uint64_t bytes, uint64_t v, uint64_t passes)
+{
+    const uint8_t *end = p + bytes;
+    uint8_t *q;
+    __asm__ volatile(
+        "dup v0.2d, %[v]\n\t"
+        "1:\n\t"
+        "mov %[q], %[p]\n\t"
+        "2:\n\t"
+        "stp q0, q0, [%[q]]\n\t"       "stp q0, q0, [%[q], #32]\n\t"
+        "stp q0, q0, [%[q], #64]\n\t"  "stp q0, q0, [%[q], #96]\n\t"
+        "stp q0, q0, [%[q], #128]\n\t" "stp q0, q0, [%[q], #160]\n\t"
+        "stp q0, q0, [%[q], #192]\n\t" "stp q0, q0, [%[q], #224]\n\t"
+        "add %[q], %[q], #256\n\t" "cmp %[q], %[end]\n\t" "b.lo 2b\n\t"
+        "subs %[n], %[n], #1\n\t" "b.ne 1b\n\t"
+        : [q] "=&r"(q), [n] "+&r"(passes) : [p] "r"(p), [end] "r"(end), [v] "r"(v) : "v0", "memory", "cc");
+}
+
 __attribute__((noinline)) static void k_copy(uint8_t *d, const uint8_t *s, uint64_t bytes)
 {
     const uint8_t *end = s + bytes;
@@ -229,6 +274,8 @@ static void k_ldr16(const uint8_t *p, uint64_t bytes) { k_read(p, bytes); }
 static void k_str16(uint8_t *p, uint64_t bytes, uint64_t v) { k_write(p, bytes, v); }
 static void k_read_pf(const uint8_t *p, uint64_t bytes, uint64_t ahead) { (void)ahead; k_read(p, bytes); }
 static void k_read_2s(const uint8_t *p, uint64_t bytes) { k_read(p, bytes); }
+static void k_read_n(const uint8_t *p, uint64_t bytes, uint64_t passes) { while (passes--) k_read(p, bytes); }
+static void k_write_n(uint8_t *p, uint64_t bytes, uint64_t v, uint64_t passes) { while (passes--) k_write(p, bytes, v); }
 #endif
 
 static volatile uint64_t cme_fold; /* XOR of the CME read kernels' folds; keeps nothing, printed nowhere */
@@ -262,6 +309,17 @@ static uint64_t pass(enum kernel k, struct thread *t, uint64_t v)
         }
     }
     return k == K_COPY ? 2 * cfg.bytes : cfg.bytes;
+}
+
+/* --asm-passes: all --passes passes of a rep in one kernel call (read and write, one segment). */
+static uint64_t pass_asm(enum kernel k, struct thread *t, uint64_t v)
+{
+    if (t->a.nseg != 1) { fprintf(stderr, "--asm-passes needs a one-segment buffer (%d segments)\n", t->a.nseg); exit(2); }
+    uint8_t *a = t->a.seg[0].base;
+    uint64_t n = t->a.seg[0].bytes;
+    if (k == K_READ) k_read_n(a, n, (uint64_t)cfg.passes);
+    else k_write_n(a, n, v, (uint64_t)cfg.passes);
+    return cfg.bytes * (uint64_t)cfg.passes;
 }
 
 static int need_b(void) { return cfg.run[K_COPY]; }
@@ -327,8 +385,11 @@ static void *worker(void *arg)
             perf_start(&pg);
             double t0 = now_s();
             uint64_t bytes = 0;
-            for (int p = 0; p < cfg.passes; p++)
-                bytes += pass(k, t, v + (uint64_t)p);
+            if (cfg.asm_passes)
+                bytes = pass_asm(k, t, v);
+            else
+                for (int p = 0; p < cfg.passes; p++)
+                    bytes += pass(k, t, v + (uint64_t)p);
             if (cfg.flush_after)
                 flush_buf(k == K_COPY ? &t->b : &t->a);
             double t1 = now_s();
@@ -350,12 +411,13 @@ static void usage(void)
     fprintf(stderr,
             "usage: bandwidth [--threads T --cpus LIST] [--bytes B] [--kernel read|write|copy|all|ldr16|str16|read-pf4|read-pf8|read-pf16|read-2s]\n"
             "                 [--passes P] [--reps R] [--mem dram|ocm|spm] [--ocm-regions 0,1,..] [--perf]\n"
-            "                 [--flush-before] [--flush-after] [--cme] [--no-hugetlb] [--no-thp] [--ocm-*/--spm-* overrides]\n"
+            "                 [--flush-before] [--flush-after] [--cme] [--asm-passes] [--no-hugetlb] [--no-thp] [--ocm-*/--spm-* overrides]\n"
             "  bytes is per thread and must be a multiple of 256 (1024 with --cme); cpus: \"2,4,6\" or \"2-9\" or \"2-8:2\"\n"
             "  --cme: run the kernels through the CME in streaming mode (needs SME2, SVL 64 B)\n"
             "  read-pf4/8/16: the read loop with a PRFM PLDL1KEEP on every line that many lines ahead; read-2s: two streams\n"
             "    over the two halves of the buffer (core kernels only, no CME form)\n"
-            "  --perf: count the core prefetch set around the timed passes, printed per 64 B line (needs --threads 1)\n");
+            "  --perf: count the core prefetch set around the timed passes, printed per 64 B line (needs --threads 1)\n"
+            "  --asm-passes: read or write only, one segment, no --cme: all passes of a rep inside one assembly call\n");
     exit(2);
 }
 
@@ -372,6 +434,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--flush-after")) cfg.flush_after = 1;
         else if (!strcmp(a, "--cme")) cfg.cme = 1;
         else if (!strcmp(a, "--perf")) cfg.use_perf = 1;
+        else if (!strcmp(a, "--asm-passes")) cfg.asm_passes = 1;
         else if (!strcmp(a, "--threads") && more) { cfg.threads = atoi(argv[++i]); threads_given = 1; }
         else if (!strcmp(a, "--cpus") && more) parse_cpus(argv[++i]);
         else if (!strcmp(a, "--bytes") && more) cfg.bytes = parse_bytes(argv[++i]);
@@ -402,15 +465,22 @@ int main(int argc, char **argv)
         fprintf(stderr, "the read-pf and read-2s kernels have no CME form\n");
         usage();
     }
+    if (cfg.asm_passes) {
+        int other = 0;
+        for (int j = 0; j < K_COUNT; j++)
+            if (cfg.run[j] && j != K_READ && j != K_WRITE) other = 1;
+        if (other || cfg.cme) { fprintf(stderr, "--asm-passes has the read and write kernels only, and no CME form\n"); usage(); }
+        if (cfg.kind == MEM_OCM && cfg.bytes > memcfg.ocm_size) { fprintf(stderr, "--asm-passes needs a one-segment buffer: at most one OCM region\n"); usage(); }
+    }
     if (cfg.kind == MEM_SPM && (cfg.run[K_READ] || cfg.run[K_WRITE] || cfg.run[K_COPY]))
         fprintf(stderr, "warning: SPM accepts only aligned 8/16/32 B accesses; ldr16/str16 are the safe kernels\n");
 
     struct thread *th = calloc((size_t)cfg.threads, sizeof *th);
     if (!th || pthread_barrier_init(&bar, NULL, (unsigned)cfg.threads + 1) != 0) { perror("setup"); return 2; }
     printf("# bandwidth: GB = 1e9 bytes; asm_kernels=%d threads=%d bytes_per_thread=%llu passes=%d reps=%d mem=%s "
-           "flush_before=%d flush_after=%d cme=%d cntfrq_hz=%llu\n", HAVE_ASM, cfg.threads,
+           "flush_before=%d flush_after=%d cme=%d asm_passes=%d cntfrq_hz=%llu\n", HAVE_ASM, cfg.threads,
            (unsigned long long)cfg.bytes, cfg.passes, cfg.reps, mem_name(cfg.kind), cfg.flush_before,
-           cfg.flush_after, cfg.cme, (unsigned long long)read_cntfrq());
+           cfg.flush_after, cfg.cme, cfg.asm_passes, (unsigned long long)read_cntfrq());
     for (int i = 0; i < cfg.threads; i++) {
         th[i].idx = i;
         th[i].cpu = cfg.ncpus ? cfg.cpus[i % cfg.ncpus] : -1;
