@@ -32,13 +32,19 @@
  *   per pass (cme_read4_n, cme_write4_n).
  * --cme rows carry two more columns (run 6): span_s, the sum over the timed
  *   passes of the time each kernel call spent inside its streaming span
- *   (CNTVCT_EL0 read after SMSTART and before SMSTOP, cme_kern.S), and
- *   span_GBps, the bytes over that time. elapsed_s minus span_s is what the
- *   calls paid outside their spans: register save, SMSTART, SMSTOP, restore
- *   and the C loop, per rep.
- * --dsb-st (CME write, default form): the write kernel ends with DSB ST
+ *   (CNTVCT_EL0 read after SMSTART and before SMSTOP, summed by the kernels
+ *   themselves in cme_span[2]; no C code runs inside the bracket), and
+ *   span_GBps, the bytes over that time. elapsed_s minus span_s is the
+ *   instrumented outside-span interval of the rep's calls: register save,
+ *   SMSTART, SMSTOP, restore, the C loop and the second stamp's six
+ *   instructions, per rep. It is not the switch alone. --cme takes one
+ *   worker: the stamps are one global pair.
+ * --dsb-st (CME write, looped form): the write kernel ends with DSB ST
  *   before SMSTOP, so the span and the call wait for the stores to complete
- *   (cme_write4_dsb). A control for the per-call cost of writes.
+ *   (observable by every observer; not the data reaching memory). A control
+ *   for the per-call cost of writes (cme_write4_dsb).
+ * --no-fold (CME read, looped form): the read kernel without its end-of-call
+ *   fold (cme_read4_nofold), the matched control for the fold's cost.
  * --flush-before: DC CIVAC the buffer before each timed rep, so reads come
  *   from the home node (OCM / SLC), not from L1/L2/L3.
  * --flush-after: DC CIVAC inside the timed region after the passes, so a
@@ -62,7 +68,7 @@ static struct {
     int threads, ncpus, cpus[MAX_CPUS];
     uint64_t bytes;
     int run[K_COUNT];
-    int passes, reps, flush_before, flush_after, cme, use_perf, asm_passes, dsb_st;
+    int passes, reps, flush_before, flush_after, cme, use_perf, asm_passes, dsb_st, no_fold;
     enum mem_kind kind;
     int regions[MAX_SEGS], nregions;
 } cfg = { .threads = 1, .bytes = 1 << 20, .passes = 4, .reps = 3, .kind = MEM_DRAM };
@@ -79,7 +85,6 @@ struct result {
 
 struct thread {
     int idx, cpu;
-    double span_acc;    /* --cme: in-span time of this rep so far (pass() and pass_asm() add each call's) */
     struct buf a, b;
     struct result res[K_COUNT][MAX_REPS];
     pthread_t tid;
@@ -303,14 +308,13 @@ static uint64_t pass(enum kernel k, struct thread *t, uint64_t v)
         uint64_t n = t->a.seg[s].bytes;
         if (cfg.cme) {
             switch (k) {
-            case K_READ: cme_fold ^= cme_read4(a, n); break;
+            case K_READ: cme_fold ^= cfg.no_fold ? cme_read4_nofold(a, n) : cme_read4(a, n); break;
             case K_WRITE: if (cfg.dsb_st) cme_write4_dsb(a, n, v); else cme_write4(a, n, v); break;
             case K_COPY: cme_copy4(t->b.seg[s].base, a, n); break;
             case K_LDR16: cme_fold ^= cme_read1(a, n); break;
             case K_STR16: cme_write1(a, n, v); break;
             default: break;
             }
-            t->span_acc += cme_span_s();
             continue;
         }
         switch (k) {
@@ -337,7 +341,6 @@ static uint64_t pass_asm(enum kernel k, struct thread *t, uint64_t v)
     if (cfg.cme) {
         if (k == K_READ) cme_fold ^= cme_read4_n(a, n, (uint64_t)cfg.passes);
         else cme_write4_n(a, n, v, (uint64_t)cfg.passes);
-        t->span_acc += cme_span_s();
     } else if (k == K_READ) k_read_n(a, n, (uint64_t)cfg.passes);
     else k_write_n(a, n, v, (uint64_t)cfg.passes);
     return cfg.bytes * (uint64_t)cfg.passes;
@@ -404,7 +407,7 @@ static void *worker(void *arg)
                 flush_buf(&t->a);
             pthread_barrier_wait(&bar);
             perf_start(&pg);
-            t->span_acc = 0;
+            cme_span_reset(); /* --cme: the kernels sum their spans into cme_span[2]; read after the bracket */
             double t0 = now_s();
             uint64_t bytes = 0;
             if (cfg.asm_passes)
@@ -418,7 +421,7 @@ static void *worker(void *arg)
             perf_stop(&pg);
             t->res[k][rep].bytes = bytes;
             t->res[k][rep].elapsed_s = t1 - t0;
-            t->res[k][rep].span_s = t->span_acc;
+            t->res[k][rep].span_s = cfg.cme ? cme_span_sum_s() : 0.0;
             if (cfg.use_perf) {
                 t->res[k][rep].perf_valid = perf_read(&pg, t->res[k][rep].c, &t->res[k][rep].perf_why);
                 t->res[k][rep].perf_cov = pg.t_enabled ? (double)pg.t_running / (double)pg.t_enabled : 0.0;
@@ -434,14 +437,15 @@ static void usage(void)
     fprintf(stderr,
             "usage: bandwidth [--threads T --cpus LIST] [--bytes B] [--kernel read|write|copy|all|ldr16|str16|read-pf4|read-pf8|read-pf16|read-2s]\n"
             "                 [--passes P] [--reps R] [--mem dram|ocm|spm] [--ocm-regions 0,1,..] [--perf]\n"
-            "                 [--flush-before] [--flush-after] [--cme] [--asm-passes] [--dsb-st] [--no-hugetlb] [--no-thp] [--ocm-*/--spm-* overrides]\n"
+            "                 [--flush-before] [--flush-after] [--cme] [--asm-passes] [--dsb-st] [--no-fold] [--no-hugetlb] [--no-thp] [--ocm-*/--spm-* overrides]\n"
             "  bytes is per thread and must be a multiple of 256 (1024 with --cme); cpus: \"2,4,6\" or \"2-9\" or \"2-8:2\"\n"
             "  --cme: run the kernels through the CME in streaming mode (needs SME2, SVL 64 B)\n"
             "  read-pf4/8/16: the read loop with a PRFM PLDL1KEEP on every line that many lines ahead; read-2s: two streams\n"
             "    over the two halves of the buffer (core kernels only, no CME form)\n"
             "  --perf: count the core prefetch set around the timed passes, printed per 64 B line (needs --threads 1)\n"
             "  --asm-passes: read or write only, one segment: all passes of a rep inside one assembly call (with --cme: one streaming span)\n"
-            "  --dsb-st: with --cme and the write kernel, default form: DSB ST before SMSTOP, so each call waits for its stores\n");
+            "  --dsb-st: with --cme and the write kernel, looped form: DSB ST before SMSTOP, so each call waits for its stores\n"
+            "  --no-fold: with --cme and the read kernel, looped form: the read kernel without its end-of-call fold\n");
     exit(2);
 }
 
@@ -460,6 +464,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--perf")) cfg.use_perf = 1;
         else if (!strcmp(a, "--asm-passes")) cfg.asm_passes = 1;
         else if (!strcmp(a, "--dsb-st")) cfg.dsb_st = 1;
+        else if (!strcmp(a, "--no-fold")) cfg.no_fold = 1;
         else if (!strcmp(a, "--threads") && more) { cfg.threads = atoi(argv[++i]); threads_given = 1; }
         else if (!strcmp(a, "--cpus") && more) parse_cpus(argv[++i]);
         else if (!strcmp(a, "--bytes") && more) cfg.bytes = parse_bytes(argv[++i]);
@@ -495,7 +500,7 @@ int main(int argc, char **argv)
         for (int j = 0; j < K_COUNT; j++)
             if (cfg.run[j] && j != K_READ && j != K_WRITE) other = 1;
         if (other) { fprintf(stderr, "--asm-passes has the read and write kernels only\n"); usage(); }
-        if (cfg.dsb_st) { fprintf(stderr, "--dsb-st is the default (one call per pass) form only\n"); usage(); }
+        if (cfg.dsb_st || cfg.no_fold) { fprintf(stderr, "--dsb-st and --no-fold are the looped (one call per pass) form only\n"); usage(); }
         if (cfg.kind == MEM_OCM && cfg.bytes > memcfg.ocm_size) { fprintf(stderr, "--asm-passes needs a one-segment buffer: at most one OCM region\n"); usage(); }
     }
     if (cfg.dsb_st) {
@@ -504,15 +509,22 @@ int main(int argc, char **argv)
             if (cfg.run[j] && j != K_WRITE) other = 1;
         if (other || !cfg.cme) { fprintf(stderr, "--dsb-st needs --cme and the write kernel\n"); usage(); }
     }
+    if (cfg.no_fold) {
+        int other = 0;
+        for (int j = 0; j < K_COUNT; j++)
+            if (cfg.run[j] && j != K_READ) other = 1;
+        if (other || !cfg.cme) { fprintf(stderr, "--no-fold needs --cme and the read kernel\n"); usage(); }
+    }
+    if (cfg.cme && cfg.threads != 1) { fprintf(stderr, "--cme takes one worker: the span stamps are one global pair\n"); usage(); }
     if (cfg.kind == MEM_SPM && (cfg.run[K_READ] || cfg.run[K_WRITE] || cfg.run[K_COPY]))
         fprintf(stderr, "warning: SPM accepts only aligned 8/16/32 B accesses; ldr16/str16 are the safe kernels\n");
 
     struct thread *th = calloc((size_t)cfg.threads, sizeof *th);
     if (!th || pthread_barrier_init(&bar, NULL, (unsigned)cfg.threads + 1) != 0) { perror("setup"); return 2; }
     printf("# bandwidth: GB = 1e9 bytes; asm_kernels=%d threads=%d bytes_per_thread=%llu passes=%d reps=%d mem=%s "
-           "flush_before=%d flush_after=%d cme=%d asm_passes=%d dsb_st=%d cntfrq_hz=%llu\n", HAVE_ASM, cfg.threads,
+           "flush_before=%d flush_after=%d cme=%d asm_passes=%d dsb_st=%d no_fold=%d cntfrq_hz=%llu\n", HAVE_ASM, cfg.threads,
            (unsigned long long)cfg.bytes, cfg.passes, cfg.reps, mem_name(cfg.kind), cfg.flush_before,
-           cfg.flush_after, cfg.cme, cfg.asm_passes, cfg.dsb_st, (unsigned long long)read_cntfrq());
+           cfg.flush_after, cfg.cme, cfg.asm_passes, cfg.dsb_st, cfg.no_fold, (unsigned long long)read_cntfrq());
     for (int i = 0; i < cfg.threads; i++) {
         th[i].idx = i;
         th[i].cpu = cfg.ncpus ? cfg.cpus[i % cfg.ncpus] : -1;
@@ -522,7 +534,7 @@ int main(int argc, char **argv)
     printf("# backing=%s\n", th[0].a.backing);
     printf("mem,kernel,threads,bytes_per_thread,rep,total_bytes,elapsed_s,aggregate_GBps,per_thread_min_GBps,per_thread_max_GBps");
     if (cfg.cme)
-        printf(",span_s,span_GBps"); /* the slowest thread's in-span time and the bytes over it; "-" when no span was stamped */
+        printf(",span_s,span_GBps"); /* the rep's in-span time and the bytes over it; "-" when no span was stamped; the best row carries the best rep's */
     if (pg.ok) {
         for (int i = 0; i < PERF_N; i++)
             printf(",%s_per_line", pg.names[i]);
@@ -547,16 +559,13 @@ int main(int argc, char **argv)
                 if (g > mx) mx = g;
             }
             double agg = (double)total / longest / 1e9;
-            if (agg > best) best = agg;
+            double gs = span > 0 ? (double)total / span / 1e9 : 0.0;
+            if (agg > best) { best = agg; best_span = gs; } /* the best row's span rate is the best rep's, so the two columns stay paired */
             printf("%s,%s%s,%d,%llu,%d,%llu,%.6f,%.3f,%.3f,%.3f", mem_name(cfg.kind), cfg.cme ? "cme-" : "", kernel_name[k], cfg.threads,
                    (unsigned long long)cfg.bytes, rep, (unsigned long long)total, longest, agg, mn, mx);
             if (cfg.cme) {
-                if (span > 0) {
-                    double gs = (double)total / span / 1e9;
-                    if (gs > best_span) best_span = gs;
-                    printf(",%.9f,%.3f", span, gs);
-                } else
-                    printf(",-,-");
+                if (span > 0) printf(",%.9f,%.3f", span, gs);
+                else printf(",-,-");
             }
             if (pg.ok) { /* one thread: its counts per 64 B line moved in the timed passes, as latency.c prints them per load */
                 const struct result *r = &th[0].res[k][rep];

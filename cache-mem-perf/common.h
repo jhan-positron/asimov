@@ -268,6 +268,7 @@ static inline int perf_open_one(struct perf_event_attr *a, int group)
  * hypothesis for this kernel, checked per load, not a TRM identity. "Inner" means a cache inside
  * the immediate cluster of the core; on Asimov that is the DSU's L3 or the other core's caches. */
 static const char *perf_name_cme[PERF_N] = { "cycles", "cme_cycles", "cme_l1d_refill_inner", "cme_l1d_refill_outer", "cme_l1d_refill_rd", "cme_l1d_refill_hwprf", "cme_l1d_refill_wr" };
+static const char *perf_name_cme_l3[PERF_N] = { "cycles", "cme_cycles", "cme_l1d_refill_inner", "cme_l1d_refill_outer", "cme_l3d_hit", "cme_l3d_miss" , "cme_l3d_refill" };
 
 static inline void perf_open_set(struct perfgrp *g, const uint64_t raw[PERF_N], const char *const names[PERF_N])
 {
@@ -388,6 +389,19 @@ static inline void perf_open_cme(struct perfgrp *g)
     perf_open_set(g, raw, perf_name_cme);
 }
 
+/* The CME L3 set (--cme --events cme-l3, run 6): the two refill-source events plus 0x328E
+ * CME_L3D_CACHE_HIT (L3 accesses by the CME that hit), 0x328F CME_L3D_CACHE_MISS (L3 demand
+ * accesses by the CME that missed) and 0x3290 CME_L3D_CACHE_REFILL (L3 refills caused by the CME),
+ * C1-SME2 TRM 107831 event table. Whether the three count on this platform, and what population
+ * each takes, is validated on the run 6 boots before any row is read through them: on a boot with the
+ * L3 in snoop-filter-only mode a hit count must read 0, and hit plus miss is compared with the inner
+ * and outer refills on the same row. The read-refill event is not in this set (six counters). */
+static inline void perf_open_cme_l3(struct perfgrp *g)
+{
+    static const uint64_t raw[PERF_N] = { 0, 0x3246, 0x327D, 0x327E, 0x328E, 0x328F, 0x3290 };
+    perf_open_set(g, raw, perf_name_cme_l3);
+}
+
 /* Reads the group. Returns 1 when the counts are valid: the group is open,
  * every ioctl since perf_start succeeded, the read returned the whole record
  * and the group ran for the whole time it was enabled during this row (no
@@ -500,7 +514,8 @@ void cme_write1(void *p, uint64_t bytes, uint64_t v);
 uint64_t cme_read4_n(const void *p, uint64_t bytes, uint64_t passes);        /* the single-call forms: all passes in one span */
 void cme_write4_n(void *p, uint64_t bytes, uint64_t v, uint64_t passes);
 void cme_write4_dsb(void *p, uint64_t bytes, uint64_t v);                   /* cme_write4 with DSB ST before SMSTOP */
-extern uint64_t cme_span[2];   /* CNTVCT_EL0 read inside the last call's span: after SMSTART, before SMSTOP (cme_kern.S) */
+uint64_t cme_read4_nofold(const void *p, uint64_t bytes);                   /* cme_read4 without the end-of-call fold */
+extern uint64_t cme_span[3];   /* CNTVCT_EL0 read inside the last call's span (after SMSTART, before SMSTOP) and the running sum of end - start (cme_kern.S) */
 #else
 /* Stand-ins so the harness builds on a non-Arm host; --cme refuses to run there. */
 static inline uint64_t cme_svl(void) { return 0; }
@@ -514,13 +529,22 @@ static inline void cme_write1(void *p, uint64_t bytes, uint64_t v) { (void)p; (v
 static inline uint64_t cme_read4_n(const void *p, uint64_t bytes, uint64_t passes) { (void)p; (void)bytes; (void)passes; return 0; }
 static inline void cme_write4_n(void *p, uint64_t bytes, uint64_t v, uint64_t passes) { (void)p; (void)bytes; (void)v; (void)passes; }
 static inline void cme_write4_dsb(void *p, uint64_t bytes, uint64_t v) { (void)p; (void)bytes; (void)v; }
-static uint64_t cme_span[2];
+static inline uint64_t cme_read4_nofold(const void *p, uint64_t bytes) { (void)p; (void)bytes; return 0; }
+static uint64_t cme_span[3];
 #endif
-/* The last call's in-span time in seconds (cme_span over the counter frequency); 0 on a host without the kernels. */
+/* The last call's in-span time in seconds (cme_span over the counter frequency); 0 on a host without the kernels.
+ * cme_span_reset and cme_span_sum_s bracket a timed region from outside it: the kernels add each call's span to
+ * cme_span[2] themselves, so no C code runs inside the caller's clock reads. */
 static inline double cme_span_s(void)
 {
     uint64_t f = read_cntfrq();
     return f ? (double)(cme_span[1] - cme_span[0]) / (double)f : 0.0;
+}
+static inline void cme_span_reset(void) { cme_span[2] = 0; }
+static inline double cme_span_sum_s(void)
+{
+    uint64_t f = read_cntfrq();
+    return f ? (double)cme_span[2] / (double)f : 0.0;
 }
 
 /* Exit unless this CPU has SME2 and the streaming vector length is 64 B (the

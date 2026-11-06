@@ -10,14 +10,20 @@
 //
 // Run 6: every span is stamped from inside. After SMSTART and before SMSTOP
 // the kernel reads the counter-timer (ISB, then CNTVCT_EL0, a system register
-// read, legal in streaming mode) into cme_span[0] and cme_span[1]. The caller's
-// clock reads sit outside the call, so span over bracket separates the loads
-// from the register save, SMSTART, SMSTOP and the restore of that call. The
-// leading ISB waits for the mode switch; the trailing ISB waits for the loop's
-// instructions to complete (an in-order core), so a read span ends after its
-// last load has returned. A store is complete once the core has issued it; a
-// span does not wait for the data to reach memory unless the kernel ends with
-// DSB ST (cme_write4_dsb).
+// read, legal in streaming mode) into cme_span[0] and cme_span[1], and adds
+// their difference to cme_span[2], a running sum the caller resets before a
+// timed bracket and reads after it (no C work inside the bracket). The span
+// is instrumented: inside it, after the first stamp, sit that stamp's store
+// and address setup (3 instructions) and, at the end, the ISB that waits for
+// the loop's instructions to complete (an in-order core, so a read span ends
+// after its last load has returned); outside it, before SMSTOP, sit the
+// second stamp's store and the sum (6 instructions). So bracket minus span
+// is the instrumented outside-span interval of the call: the register save,
+// SMSTART, SMSTOP, the restore, the caller's call and return, and those six
+// instructions. It is not the switch alone. A store's completion, which
+// DSB ST waits for in cme_write4_dsb, is the point at which every observer
+// sees it; it is not the data reaching memory, and the CME L1 may hold the
+// written line (C1-SME2 TRM section 6.2).
 //
 // The read kernels fold every loaded vector with EOR and return the XOR of
 // all 8-byte words, so cme_test.c can check them against a scalar fold. Each
@@ -44,7 +50,10 @@
 //   void     cme_write4_n(void *p, uint64_t bytes, uint64_t v, uint64_t passes)  cme_write4's loop `passes` times in one span
 //   void     cme_write4_dsb(void *p, uint64_t bytes, uint64_t v)   cme_write4 with DSB ST before SMSTOP, so the
 //                                                       span and the call wait for the stores to complete
-//   uint64_t cme_span[2]                                CNTVCT_EL0 after SMSTART and before SMSTOP of the last call
+//   uint64_t cme_read4_nofold(const void *p, uint64_t bytes)  cme_read4 without the end-of-call fold (returns 0):
+//                                                       the matched control for the fold's cost per call
+//   uint64_t cme_span[3]                                CNTVCT_EL0 after SMSTART and before SMSTOP of the last
+//                                                       call, and the running sum of (end - start) over calls
 //
 // Streaming-mode forms are from the Arm C1-Nano SOG section 2.33 and the
 // asimov-bench cme-perf chase.S / stream.S (the same LD1D + LASTB chase and
@@ -73,7 +82,12 @@
 	mrs	x9, cntvct_el0
 	adrp	x10, cme_span
 	add	x10, x10, :lo12:cme_span
+	ldr	x11, [x10]
 	str	x9, [x10, #8]
+	sub	x9, x9, x11
+	ldr	x11, [x10, #16]
+	add	x11, x11, x9
+	str	x11, [x10, #16]
 	smstop	sm
 	ldr	x9, [sp, #64]
 	msr	fpcr, x9
@@ -120,16 +134,33 @@ cme_roundtrip:
 	ret
 	.size	cme_roundtrip, . - cme_roundtrip
 
-	.global	cme_read4
-	.type	cme_read4, %function
+// cme_read4 and cme_read4_nofold share one body; the second skips the
+// end-of-call fold (15 EOR, EORV, FMOV) and returns 0, so the two differ in
+// the fold alone (run 6 control).
+.macro	CME_READ4 name, fold
+	.global	\name
+	.type	\name, %function
 	.p2align 6
-cme_read4:
+\name:
 	SM_ENTER
 	ptrue	pn8.b
 	ptrue	p0.d
-	.irp	n, 16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
-	mov	z\n\().d, #0
-	.endr
+	mov	z16.d, #0
+	mov	z17.d, #0
+	mov	z18.d, #0
+	mov	z19.d, #0
+	mov	z20.d, #0
+	mov	z21.d, #0
+	mov	z22.d, #0
+	mov	z23.d, #0
+	mov	z24.d, #0
+	mov	z25.d, #0
+	mov	z26.d, #0
+	mov	z27.d, #0
+	mov	z28.d, #0
+	mov	z29.d, #0
+	mov	z30.d, #0
+	mov	z31.d, #0
 	add	x2, x0, x1
 	.p2align 6
 1:	ld1b	{z0.b - z3.b}, pn8/z, [x0]
@@ -155,14 +186,33 @@ cme_read4:
 	add	x0, x0, #1024
 	cmp	x0, x2
 	b.lo	1b
-	.irp	n, 17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
-	eor	z16.d, z16.d, z\n\().d
-	.endr
+	.if	\fold
+	eor	z16.d, z16.d, z17.d
+	eor	z16.d, z16.d, z18.d
+	eor	z16.d, z16.d, z19.d
+	eor	z16.d, z16.d, z20.d
+	eor	z16.d, z16.d, z21.d
+	eor	z16.d, z16.d, z22.d
+	eor	z16.d, z16.d, z23.d
+	eor	z16.d, z16.d, z24.d
+	eor	z16.d, z16.d, z25.d
+	eor	z16.d, z16.d, z26.d
+	eor	z16.d, z16.d, z27.d
+	eor	z16.d, z16.d, z28.d
+	eor	z16.d, z16.d, z29.d
+	eor	z16.d, z16.d, z30.d
+	eor	z16.d, z16.d, z31.d
 	eorv	d0, p0, z16.d
 	fmov	x0, d0
+	.else
+	mov	x0, #0
+	.endif
 	SM_LEAVE
 	ret
-	.size	cme_read4, . - cme_read4
+	.size	\name, . - \name
+.endm
+	CME_READ4 cme_read4, 1
+	CME_READ4 cme_read4_nofold, 0
 
 // cme_write4 and cme_write4_dsb share one body; the DSB ST of the second
 // waits inside the span and the call for every store to complete.
@@ -368,7 +418,7 @@ cme_write1:
 	.type	cme_span, %object
 	.p2align 3
 cme_span:
-	.skip	16
-	.size	cme_span, 16
+	.skip	24
+	.size	cme_span, 24
 
 	.section .note.GNU-stack, "", %progbits

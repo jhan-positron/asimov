@@ -16,10 +16,12 @@
 #   bandwidth  read / write / copy with 256 B per instruction at the phase D footprints plus
 #              160 KiB and 1 MiB; single-vector 64 B forms; the 1 KiB per-call cost rows;
 #              OCM read per region and all five, OCM streaming write
-#   F2 (run 6) the per-call cost rows: looped and single-call forms at 4 to 24 KiB, the DSB ST
-#              write rows, per-call writes at 2 to 8 KiB; every --cme row prints its in-span time
-# Chip time about 1.7 s (est.), most of it the 14 ms launch allowance; 56 commands, 71 launches
-# (`sh run_cme.sh --dry-run | python3 est_chip_time.py`). Wall time about 1.3 h at 2,779 s per
+#   F2 (run 6) the per-call cost rows: looped and single-call forms at 4 to 24 KiB, the no-fold
+#              read and DSB ST write controls, per-call writes at 2 to 8 KiB, single-call rows at
+#              48 KiB to 256 KiB, the chase sizes under the CME L3 events; every --cme row prints
+#              its in-span time
+# Chip time about 2.4 s (est.), half of it the 14 ms launch allowance; 70 commands, 85 launches
+# (`sh run_cme.sh --dry-run | python3 est_chip_time.py`). Wall time about 1.8 h at 2,779 s per
 # chip second, plus boot.
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -85,26 +87,49 @@ if [ "$HAVE_SME2" = 1 ]; then
     run cme-bandwidth-call-cost.csv "$BW" --cme --threads 1 --cpus $CPU --bytes 1K --kernel write --passes 4096 --reps 3
     # F2 (run 6): the per-call cost of the CME bandwidth kernels, measured three ways. Every --cme
     # row above now also prints its in-span time (span_s: CNTVCT_EL0 read after SMSTART and before
-    # SMSTOP in each call, summed), so elapsed minus span is what the calls paid outside their
-    # spans. These rows add, at the G8 sizes with 5 reps as G8: the looped form (one call per pass,
-    # cme-bandwidth-l1-passes.csv) and the single-call form (all passes of a rep in one streaming
-    # span, --asm-passes, cme-bandwidth-l1-asmpasses.csv), read and write, whose fitted intercepts
-    # give each form's fixed cost per pass; a write row with DSB ST before SMSTOP (--dsb-st,
-    # cme-bandwidth-l1-dsb.csv), which makes each call wait for its stores; and per-call write rows
-    # at 2, 4 and 8 KiB beside the 1 KiB row above, to see at which size the per-call cost of a
-    # short write call disappears.
+    # SMSTOP in each call, summed by the kernels), so elapsed minus span is the instrumented
+    # outside-span interval of the calls (save, SMSTART, SMSTOP, restore, call and return, the
+    # second stamp's instructions), not the switch alone. These rows add, at the G8 sizes with 5
+    # reps as G8: the looped form (one call per pass, cme-bandwidth-l1-passes.csv) and the
+    # single-call form (all passes of a rep in one streaming span, --asm-passes,
+    # cme-bandwidth-l1-asmpasses.csv), read and write, whose fitted intercepts give each form's
+    # fixed cost per pass; the looped read without its end-of-call fold (--no-fold,
+    # cme-bandwidth-l1-nofold.csv), the matched control for the fold; a write row with DSB ST
+    # before SMSTOP (--dsb-st, cme-bandwidth-l1-dsb.csv), which makes each call wait for its stores
+    # to complete; per-call write rows at 2, 4 and 8 KiB beside the 1 KiB row above, to see at which
+    # size the per-call cost of a short write call disappears; and the single-call form at the 48 KiB
+    # to 256 KiB sizes of the sweep above (cme-bandwidth-dram-1core-asmpasses.csv), so every
+    # read and write row below 256 KiB has its single-call twin.
     for sp in 4K:1024 8K:512 16K:256 24K:176; do
         s=${sp%%:*}; p=${sp##*:}
         for k in read write; do
             run cme-bandwidth-l1-passes.csv "$BW" --cme --threads 1 --cpus $CPU --bytes $s --kernel $k --passes $p --reps 5
             run cme-bandwidth-l1-asmpasses.csv "$BW" --cme --asm-passes --threads 1 --cpus $CPU --bytes $s --kernel $k --passes $p --reps 5
         done
+        run cme-bandwidth-l1-nofold.csv "$BW" --cme --no-fold --threads 1 --cpus $CPU --bytes $s --kernel read --passes $p --reps 5
         run cme-bandwidth-l1-dsb.csv "$BW" --cme --dsb-st --threads 1 --cpus $CPU --bytes $s --kernel write --passes $p --reps 5
     done
     for sp in 2K:2048 4K:1024 8K:512; do
         s=${sp%%:*}; p=${sp##*:}
         run cme-bandwidth-call-cost.csv "$BW" --cme --threads 1 --cpus $CPU --bytes $s --kernel write --passes $p --reps 3
     done
+    for sp in 48K:128 96K:64 160K:32 256K:32; do
+        s=${sp%%:*}; p=${sp##*:}
+        for k in read write; do
+            run cme-bandwidth-dram-1core-asmpasses.csv "$BW" --cme --asm-passes --threads 1 --cpus $CPU --bytes $s --kernel $k --passes $p --reps 3
+        done
+    done
+    # F2 (run 6): the CME chase sizes again under the CME's L3 events (0x328E hit, 0x328F miss,
+    # 0x3290 refill, with the inner and outer refills), to validate the three events and, on the
+    # prefetcher-off boot, to read which level served the loads beside the refill-source counts.
+    run cme-latency-dram-small-l3.csv "$LAT" --cme --cpu $CPU --perf --events cme-l3 --loads 64K --reps 3 \
+        --sizes 4K,8K,16K,24K,32K,48K,64K,96K,128K,192K,256K,384K
+    if [ "$QUICK" = 1 ]; then
+        run cme-latency-dram-large-l3.csv "$LAT" --cme --cpu $CPU --perf --events cme-l3 --fresh 3 --sizes 512K,1M,2M,4M
+    else
+        run cme-latency-dram-large-l3.csv "$LAT" --cme --cpu $CPU --perf --events cme-l3 --fresh 3 \
+            --sizes 512K,768K,1M,1.5M,2M,3M,4M,6M,8M,16M,32M
+    fi
     if [ "$HAVE_OCM" = 1 ]; then
         for r in 0 1 2 3 4; do
             run cme-bandwidth-ocm-region$r.csv cmn "cme-ocm-read-region$r" "$BW" --cme --threads 1 --cpus $CPU --mem ocm --ocm-regions $r --bytes 256K --kernel read --flush-before --passes 1 --reps 3

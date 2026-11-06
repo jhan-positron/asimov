@@ -62,9 +62,14 @@
  *   by the CME's hardware prefetcher). Every --cme row carries one more
  *   column (run 6), ns_per_load_span: the time the call spent inside its
  *   streaming span (CNTVCT_EL0 read after SMSTART and before SMSTOP, in
- *   cme_kern.S) per load. ns_per_load minus it is what the call paid outside
- *   the span: register save, SMSTART, SMSTOP and restore, spread over the
- *   loads. The cme-call rows sum the 64 spans of their 64 calls.
+ *   cme_kern.S) per load. ns_per_load minus it is the instrumented
+ *   outside-span interval of the call (register save, SMSTART, SMSTOP,
+ *   restore, the call and return, and the second stamp's six instructions),
+ *   spread over the loads; it is not the switch alone. The cme-call rows sum
+ *   the 64 spans of their 64 calls (the kernels keep the sum in cme_span[2];
+ *   no C code runs inside the bracket). --events cme-l3 with --cme swaps the
+ *   three refill-by-cause events for the CME's L3 hit, miss and refill
+ *   events (0x328E, 0x328F, 0x3290), to be validated on the run 6 boots.
  * Counter columns: a row prints "-" for every counter, and a "# perf:" line
  *   with the reason, when the group did not count the whole walk (open
  *   failure, ioctl failure, short read, multiplexing). The timing stays valid.
@@ -89,6 +94,7 @@ static int seq;    /* --seq: the chain is the lines in address order */
 static int ev_tlb; /* --events tlb: the translation counter set instead of the prefetch set */
 static int ev_l3;  /* --events l3: the L2 and L3 hit counter set instead of the prefetch set */
 static int ev_walk; /* --events walk: the TLB walk set (walks by descriptor type) instead of the prefetch set */
+static int ev_cme_l3; /* --events cme-l3 (with --cme): the CME L3 hit, miss and refill events instead of the refill-by-cause events */
 #define LINES_PER_PAGE (4096 / LINE_BYTES)
 
 /* Line index of member k of chain `slot`: every line in order, or one line per
@@ -284,19 +290,19 @@ static void run_roundtrip(void)
      * holds the register save, SMSTART, the predicate setup, one register hop,
      * SMSTOP and the restore, plus the C loop around it. The span column (the
      * sum of the 64 in-span times, per call) holds the predicate setup and the
-     * hop; ns_per_load minus it is the rest. A sparse 64-hop chase pass pays
-     * the same entry and exit once, so a short pass is read beside this row. */
+     * hop; ns_per_load minus it is the instrumented outside-span interval of a
+     * call, not the switch alone. A sparse 64-hop chase pass pays the same
+     * entry and exit once, so a short pass is read beside this row. */
     best = 1e30;
     for (int rep = 0; rep < cfg.reps; rep++) {
-        double span = 0;
         perf_start(&pg);
+        cme_span_reset();
         double t0 = now_s();
-        for (int i = 0; i < 64; i++) {
+        for (int i = 0; i < 64; i++)
             x = cme_roundtrip(x, 1);
-            span += cme_span_s();
-        }
         double t1 = now_s();
         perf_stop(&pg);
+        double span = cme_span_sum_s();
         int valid = perf_read(&pg, c, &why);
         double ns = (t1 - t0) * 1e9 / 64.0;
         if (ns < best) best = ns;
@@ -335,7 +341,7 @@ static void usage(void)
     fprintf(stderr,
             "usage: latency --sizes a,b,c [--cpu N] [--mem dram|ocm|spm] [--ocm-regions 0,1,..]\n"
             "               [--loads N] [--reps R] [--fresh K] [--flush] [--sparse | --sparse-vary] [--seq]\n"
-            "               [--perf] [--events prefetch|tlb|l3|walk] [--cme] [--no-hugetlb] [--no-thp]\n"
+            "               [--perf] [--events prefetch|tlb|l3|walk|cme-l3] [--cme] [--no-hugetlb] [--no-thp]\n"
             "               [--ocm-dev P --ocm-base A --ocm-stride S --ocm-size B] [--spm-dev P --spm-off O]\n"
             "  sizes accept K/M/G suffixes. --mem ocm splits each size evenly over the listed regions.\n"
             "  --fresh K (2..8): K chains per line, time one pass over each of chains 1..K-1.\n"
@@ -347,6 +353,7 @@ static void usage(void)
             "  --events tlb: count the TLB refills and walks instead of the prefetch refills (core sets only).\n"
             "  --events l3: count the L2 and L3 demand read hits and the L3 read accesses instead (core sets only).\n"
             "  --events walk: count the TLB walks and their block and page parts instead (core sets only).\n"
+            "  --events cme-l3: with --cme, count the CME's L3 hit, miss and refill events instead of its refill-by-cause events.\n"
             "  --cme: chase through the CME in streaming mode (needs SME2, SVL 64 B); adds a cme-roundtrip row.\n");
     exit(2);
 }
@@ -370,6 +377,7 @@ int main(int argc, char **argv)
             if (!strcmp(e, "tlb")) ev_tlb = 1;
             else if (!strcmp(e, "l3")) ev_l3 = 1;
             else if (!strcmp(e, "walk")) ev_walk = 1;
+            else if (!strcmp(e, "cme-l3")) ev_cme_l3 = 1;
             else if (strcmp(e, "prefetch")) usage();
         }
         else if (!strcmp(a, "--perf")) cfg.use_perf = 1;
@@ -391,9 +399,10 @@ int main(int argc, char **argv)
         pin_cpu(cfg.cpu);
     if (use_cme)
         require_cme();
-    if (ev_tlb + ev_l3 + ev_walk > 1) { fprintf(stderr, "--events tlb, l3 and walk are exclusive\n"); usage(); }
+    if (ev_tlb + ev_l3 + ev_walk + ev_cme_l3 > 1) { fprintf(stderr, "--events tlb, l3, walk and cme-l3 are exclusive\n"); usage(); }
+    if (ev_cme_l3 && !use_cme) { fprintf(stderr, "--events cme-l3 needs --cme\n"); usage(); }
     if (cfg.use_perf) {
-        if (use_cme) perf_open_cme(&pg);
+        if (use_cme) { if (ev_cme_l3) perf_open_cme_l3(&pg); else perf_open_cme(&pg); }
         else if (ev_tlb) perf_open_tlb(&pg);
         else if (ev_l3) perf_open_l3(&pg);
         else if (ev_walk) perf_open_walk(&pg);
@@ -402,7 +411,7 @@ int main(int argc, char **argv)
 
     printf("# latency: ns_per_load = elapsed_ns / loads; cpu=%d mem=%s cntfrq_hz=%llu loads=%llu reps=%d fresh=%d flush=%d sparse=%d seq=%d cme=%d events=%s\n",
            cfg.cpu, mem_name(cfg.kind), (unsigned long long)read_cntfrq(), (unsigned long long)cfg.loads,
-           cfg.reps, cfg.fresh, cfg.flush, sparse, seq, use_cme, use_cme ? "cme" : ev_tlb ? "tlb" : ev_l3 ? "l3" : ev_walk ? "walk" : "prefetch");
+           cfg.reps, cfg.fresh, cfg.flush, sparse, seq, use_cme, use_cme ? (ev_cme_l3 ? "cme-l3" : "cme") : ev_tlb ? "tlb" : ev_l3 ? "l3" : ev_walk ? "walk" : "prefetch");
     printf("mem,size_bytes,mode,rep,loads,ns_per_load");
     if (use_cme)
         printf(",ns_per_load_span"); /* run 6: the call's time inside its streaming span, per load */

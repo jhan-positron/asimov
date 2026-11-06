@@ -102,6 +102,7 @@ int main(int argc, char **argv)
         CHECK(cme_read4_n(a, N, 3) == fold_ref(a, N), "read4_n fold, 3 passes over 64 KiB");
         CHECK(cme_read4_n(a, 1024, 2) == 0, "read4_n fold, 2 passes over 1 KiB");
         CHECK(cme_read4_n(a, N, 1) == cme_read4(a, N), "read4_n 1 pass equals read4");
+        CHECK(cme_read4_nofold(a, N) == 0 && cme_read4(a, N) == fold_ref(a, N), "read4_nofold returns 0 and leaves read4's fold intact");
         memset(b, 0xEE, N);
         cme_write4_n(b, N - 1024, 0x5A5A5A5A5A5A5A5AULL, 3);
         ok = 1;
@@ -131,6 +132,10 @@ int main(int argc, char **argv)
     short_span = cme_span[1] - cme_span[0];
     CHECK(long_span > short_span, "65536-hop span longer than a 1-hop span");
     CHECK(read_cntfrq() > 0, "counter frequency readable");
+    cme_span_reset();
+    uint64_t sum = 0;
+    for (int i = 0; i < 5; i++) { (void)cme_roundtrip(1, 1); sum += cme_span[1] - cme_span[0]; }
+    CHECK(cme_span[2] == sum && sum > 0, "running span sum equals the sum of the five calls' spans");
 
     /* the kernels leave the caller's state alone: a second pass gives the same fold */
     CHECK(cme_read1(a, N) == fold_ref(a, N), "read1 fold, second pass");
