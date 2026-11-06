@@ -497,6 +497,10 @@ void cme_write4(void *p, uint64_t bytes, uint64_t v);
 void cme_copy4(void *d, const void *s, uint64_t bytes);
 uint64_t cme_read1(const void *p, uint64_t bytes);
 void cme_write1(void *p, uint64_t bytes, uint64_t v);
+uint64_t cme_read4_n(const void *p, uint64_t bytes, uint64_t passes);        /* the single-call forms: all passes in one span */
+void cme_write4_n(void *p, uint64_t bytes, uint64_t v, uint64_t passes);
+void cme_write4_dsb(void *p, uint64_t bytes, uint64_t v);                   /* cme_write4 with DSB ST before SMSTOP */
+extern uint64_t cme_span[2];   /* CNTVCT_EL0 read inside the last call's span: after SMSTART, before SMSTOP (cme_kern.S) */
 #else
 /* Stand-ins so the harness builds on a non-Arm host; --cme refuses to run there. */
 static inline uint64_t cme_svl(void) { return 0; }
@@ -507,7 +511,17 @@ static inline void cme_write4(void *p, uint64_t bytes, uint64_t v) { (void)p; (v
 static inline void cme_copy4(void *d, const void *s, uint64_t bytes) { (void)d; (void)s; (void)bytes; }
 static inline uint64_t cme_read1(const void *p, uint64_t bytes) { (void)p; (void)bytes; return 0; }
 static inline void cme_write1(void *p, uint64_t bytes, uint64_t v) { (void)p; (void)bytes; (void)v; }
+static inline uint64_t cme_read4_n(const void *p, uint64_t bytes, uint64_t passes) { (void)p; (void)bytes; (void)passes; return 0; }
+static inline void cme_write4_n(void *p, uint64_t bytes, uint64_t v, uint64_t passes) { (void)p; (void)bytes; (void)v; (void)passes; }
+static inline void cme_write4_dsb(void *p, uint64_t bytes, uint64_t v) { (void)p; (void)bytes; (void)v; }
+static uint64_t cme_span[2];
 #endif
+/* The last call's in-span time in seconds (cme_span over the counter frequency); 0 on a host without the kernels. */
+static inline double cme_span_s(void)
+{
+    uint64_t f = read_cntfrq();
+    return f ? (double)(cme_span[1] - cme_span[0]) / (double)f : 0.0;
+}
 
 /* Exit unless this CPU has SME2 and the streaming vector length is 64 B (the
  * Asimov CME). Prints the reason: the row then says why it is missing. */

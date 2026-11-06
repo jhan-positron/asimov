@@ -96,6 +96,42 @@ int main(int argc, char **argv)
         CHECK(ok, "copy4 end guard");
     }
 
+    /* run 6: the single-call forms. An odd number of read passes folds to the
+     * scalar XOR, an even number to zero (each word enters the fold once per pass). */
+    if (!sme1) {
+        CHECK(cme_read4_n(a, N, 3) == fold_ref(a, N), "read4_n fold, 3 passes over 64 KiB");
+        CHECK(cme_read4_n(a, 1024, 2) == 0, "read4_n fold, 2 passes over 1 KiB");
+        CHECK(cme_read4_n(a, N, 1) == cme_read4(a, N), "read4_n 1 pass equals read4");
+        memset(b, 0xEE, N);
+        cme_write4_n(b, N - 1024, 0x5A5A5A5A5A5A5A5AULL, 3);
+        ok = 1;
+        for (uint64_t i = 0; i < (N - 1024) / 8; i++) ok &= ((uint64_t *)b)[i] == 0x5A5A5A5A5A5A5A5AULL;
+        for (uint64_t i = (N - 1024) / 8; i < N / 8; i++) ok &= ((uint64_t *)b)[i] == 0xEEEEEEEEEEEEEEEEULL;
+        CHECK(ok, "write4_n pattern and end guard, 3 passes");
+        memset(b, 0xEE, N);
+        cme_write4_dsb(b, N - 1024, 0xA5A5A5A5A5A5A5A5ULL);
+        ok = 1;
+        for (uint64_t i = 0; i < (N - 1024) / 8; i++) ok &= ((uint64_t *)b)[i] == 0xA5A5A5A5A5A5A5A5ULL;
+        for (uint64_t i = (N - 1024) / 8; i < N / 8; i++) ok &= ((uint64_t *)b)[i] == 0xEEEEEEEEEEEEEEEEULL;
+        CHECK(ok, "write4_dsb pattern and end guard");
+    }
+
+    /* run 6: the in-span stamps. Every call leaves cme_span[1] at or after
+     * cme_span[0], a longer chain takes a longer span, and the span is shorter
+     * than the whole call as the caller's clock sees it. */
+    uint64_t s0 = cme_span[0], s1 = cme_span[1];
+    CHECK(s1 >= s0, "span stamps ordered after the last call");
+    double tb0 = now_s();
+    (void)cme_roundtrip(1, 1 << 16);
+    double tb1 = now_s();
+    uint64_t short_span, long_span = cme_span[1] - cme_span[0];
+    CHECK(cme_span[1] >= cme_span[0] && cme_span[0] != s0, "span stamps rewritten by the call");
+    CHECK(cme_span_s() <= tb1 - tb0, "span inside the caller's bracket");
+    (void)cme_roundtrip(1, 1);
+    short_span = cme_span[1] - cme_span[0];
+    CHECK(long_span > short_span, "65536-hop span longer than a 1-hop span");
+    CHECK(read_cntfrq() > 0, "counter frequency readable");
+
     /* the kernels leave the caller's state alone: a second pass gives the same fold */
     CHECK(cme_read1(a, N) == fold_ref(a, N), "read1 fold, second pass");
 

@@ -59,7 +59,12 @@
  *   access: a control with the same register return path, not a measured
  *   part of a chase hop. --perf then counts the CME set (cycles, CME_CYCLES,
  *   CME L1 refills from inside the cluster, from outside the cluster, by reads,
- *   by the CME's hardware prefetcher).
+ *   by the CME's hardware prefetcher). Every --cme row carries one more
+ *   column (run 6), ns_per_load_span: the time the call spent inside its
+ *   streaming span (CNTVCT_EL0 read after SMSTART and before SMSTOP, in
+ *   cme_kern.S) per load. ns_per_load minus it is what the call paid outside
+ *   the span: register save, SMSTART, SMSTOP and restore, spread over the
+ *   loads. The cme-call rows sum the 64 spans of their 64 calls.
  * Counter columns: a row prints "-" for every counter, and a "# perf:" line
  *   with the reason, when the group did not count the whole walk (open
  *   failure, ioctl failure, short read, multiplexing). The timing stays valid.
@@ -203,6 +208,8 @@ static double timed_walk(const struct buf *b, void *start, uint64_t loads, const
     double ns = (t1 - t0) * 1e9 / (double)loads;
     printf("%s,%llu,%s%s,%d,%llu,%.3f", mem_name(b->kind), (unsigned long long)b->bytes, use_cme ? "cme-" : "",
            label, rep, (unsigned long long)loads, ns);
+    if (use_cme)
+        printf(",%.3f", cme_span_s() * 1e9 / (double)loads);
     print_counters(c, loads, valid, why);
     (void)n;
     return ns;
@@ -266,7 +273,8 @@ static void run_roundtrip(void)
         int valid = perf_read(&pg, c, &why);
         double ns = (t1 - t0) * 1e9 / (double)cfg.loads;
         if (ns < best) best = ns;
-        printf("%s,0,cme-roundtrip,%d,%llu,%.3f", mem_name(cfg.kind), rep, (unsigned long long)cfg.loads, ns);
+        printf("%s,0,cme-roundtrip,%d,%llu,%.3f,%.3f", mem_name(cfg.kind), rep, (unsigned long long)cfg.loads, ns,
+               cme_span_s() * 1e9 / (double)cfg.loads);
         print_counters(c, cfg.loads, valid, why);
     }
     sink = (void *)(uintptr_t)x;
@@ -274,21 +282,25 @@ static void run_roundtrip(void)
     /* A complete one-hop control: 64 calls of cme_roundtrip with one DUP + LASTB
      * hop each, timed together and printed per call (loads = 64). Each call
      * holds the register save, SMSTART, the predicate setup, one register hop,
-     * SMSTOP and the restore, plus the C loop around it; the parts are not
-     * separated. A sparse 64-hop chase pass pays the same entry and exit once,
-     * so a short pass is read beside this row, not corrected by it. */
+     * SMSTOP and the restore, plus the C loop around it. The span column (the
+     * sum of the 64 in-span times, per call) holds the predicate setup and the
+     * hop; ns_per_load minus it is the rest. A sparse 64-hop chase pass pays
+     * the same entry and exit once, so a short pass is read beside this row. */
     best = 1e30;
     for (int rep = 0; rep < cfg.reps; rep++) {
+        double span = 0;
         perf_start(&pg);
         double t0 = now_s();
-        for (int i = 0; i < 64; i++)
+        for (int i = 0; i < 64; i++) {
             x = cme_roundtrip(x, 1);
+            span += cme_span_s();
+        }
         double t1 = now_s();
         perf_stop(&pg);
         int valid = perf_read(&pg, c, &why);
         double ns = (t1 - t0) * 1e9 / 64.0;
         if (ns < best) best = ns;
-        printf("%s,0,cme-call,%d,64,%.3f", mem_name(cfg.kind), rep, ns);
+        printf("%s,0,cme-call,%d,64,%.3f,%.3f", mem_name(cfg.kind), rep, ns, span * 1e9 / 64.0);
         print_counters(c, 64, valid, why);
     }
     sink = (void *)(uintptr_t)x;
@@ -392,6 +404,8 @@ int main(int argc, char **argv)
            cfg.cpu, mem_name(cfg.kind), (unsigned long long)read_cntfrq(), (unsigned long long)cfg.loads,
            cfg.reps, cfg.fresh, cfg.flush, sparse, seq, use_cme, use_cme ? "cme" : ev_tlb ? "tlb" : ev_l3 ? "l3" : ev_walk ? "walk" : "prefetch");
     printf("mem,size_bytes,mode,rep,loads,ns_per_load");
+    if (use_cme)
+        printf(",ns_per_load_span"); /* run 6: the call's time inside its streaming span, per load */
     if (pg.ok) {
         for (int i = 0; i < PERF_N; i++)
             printf(",%s_per_load", pg.names[i]);

@@ -20,14 +20,25 @@
  *   the L1, L2 and L3 refills, the refills by the hardware prefetchers) is
  *   counted around the timed passes of each rep and printed per 64 B line of
  *   data moved, with the coverage column, as latency.c prints them per load.
- * --asm-passes (read and write, one segment, no --cme): the kernel walks the
+ * --asm-passes (read and write, one segment): the kernel walks the
  *   buffer --passes times inside one assembly call, so a rep has one call, one
  *   return and one save of d8-d15 instead of one per pass. The inner loop
  *   still falls through once per pass (mov, subs, b.ne). The default form
  *   also runs pass()'s segment loop, dispatch and byte accounting and the C
  *   loop's step at every pass. The two forms together measure the net cost
  *   of that machinery against the assembly's own loop step, not the call
- *   and return alone.
+ *   and return alone. With --cme (run 6) the CME form holds all passes in
+ *   one streaming span: one SMSTART and one SMSTOP per rep instead of one
+ *   per pass (cme_read4_n, cme_write4_n).
+ * --cme rows carry two more columns (run 6): span_s, the sum over the timed
+ *   passes of the time each kernel call spent inside its streaming span
+ *   (CNTVCT_EL0 read after SMSTART and before SMSTOP, cme_kern.S), and
+ *   span_GBps, the bytes over that time. elapsed_s minus span_s is what the
+ *   calls paid outside their spans: register save, SMSTART, SMSTOP, restore
+ *   and the C loop, per rep.
+ * --dsb-st (CME write, default form): the write kernel ends with DSB ST
+ *   before SMSTOP, so the span and the call wait for the stores to complete
+ *   (cme_write4_dsb). A control for the per-call cost of writes.
  * --flush-before: DC CIVAC the buffer before each timed rep, so reads come
  *   from the home node (OCM / SLC), not from L1/L2/L3.
  * --flush-after: DC CIVAC inside the timed region after the passes, so a
@@ -51,7 +62,7 @@ static struct {
     int threads, ncpus, cpus[MAX_CPUS];
     uint64_t bytes;
     int run[K_COUNT];
-    int passes, reps, flush_before, flush_after, cme, use_perf, asm_passes;
+    int passes, reps, flush_before, flush_after, cme, use_perf, asm_passes, dsb_st;
     enum mem_kind kind;
     int regions[MAX_SEGS], nregions;
 } cfg = { .threads = 1, .bytes = 1 << 20, .passes = 4, .reps = 3, .kind = MEM_DRAM };
@@ -59,6 +70,7 @@ static struct {
 struct result {
     uint64_t bytes;
     double elapsed_s;
+    double span_s;      /* --cme: the timed passes' time inside their streaming spans, summed over the kernel calls */
     uint64_t c[PERF_N]; /* --perf: the counts over the timed passes */
     int perf_valid;
     const char *perf_why;
@@ -67,6 +79,7 @@ struct result {
 
 struct thread {
     int idx, cpu;
+    double span_acc;    /* --cme: in-span time of this rep so far (pass() and pass_asm() add each call's) */
     struct buf a, b;
     struct result res[K_COUNT][MAX_REPS];
     pthread_t tid;
@@ -291,12 +304,13 @@ static uint64_t pass(enum kernel k, struct thread *t, uint64_t v)
         if (cfg.cme) {
             switch (k) {
             case K_READ: cme_fold ^= cme_read4(a, n); break;
-            case K_WRITE: cme_write4(a, n, v); break;
+            case K_WRITE: if (cfg.dsb_st) cme_write4_dsb(a, n, v); else cme_write4(a, n, v); break;
             case K_COPY: cme_copy4(t->b.seg[s].base, a, n); break;
             case K_LDR16: cme_fold ^= cme_read1(a, n); break;
             case K_STR16: cme_write1(a, n, v); break;
             default: break;
             }
+            t->span_acc += cme_span_s();
             continue;
         }
         switch (k) {
@@ -313,13 +327,18 @@ static uint64_t pass(enum kernel k, struct thread *t, uint64_t v)
     return k == K_COPY ? 2 * cfg.bytes : cfg.bytes;
 }
 
-/* --asm-passes: all --passes passes of a rep in one kernel call (read and write, one segment). */
+/* --asm-passes: all --passes passes of a rep in one kernel call (read and write, one segment);
+ * with --cme, in one streaming span. */
 static uint64_t pass_asm(enum kernel k, struct thread *t, uint64_t v)
 {
     if (t->a.nseg != 1) { fprintf(stderr, "--asm-passes needs a one-segment buffer (%d segments)\n", t->a.nseg); exit(2); }
     uint8_t *a = t->a.seg[0].base;
     uint64_t n = t->a.seg[0].bytes;
-    if (k == K_READ) k_read_n(a, n, (uint64_t)cfg.passes);
+    if (cfg.cme) {
+        if (k == K_READ) cme_fold ^= cme_read4_n(a, n, (uint64_t)cfg.passes);
+        else cme_write4_n(a, n, v, (uint64_t)cfg.passes);
+        t->span_acc += cme_span_s();
+    } else if (k == K_READ) k_read_n(a, n, (uint64_t)cfg.passes);
     else k_write_n(a, n, v, (uint64_t)cfg.passes);
     return cfg.bytes * (uint64_t)cfg.passes;
 }
@@ -385,6 +404,7 @@ static void *worker(void *arg)
                 flush_buf(&t->a);
             pthread_barrier_wait(&bar);
             perf_start(&pg);
+            t->span_acc = 0;
             double t0 = now_s();
             uint64_t bytes = 0;
             if (cfg.asm_passes)
@@ -398,6 +418,7 @@ static void *worker(void *arg)
             perf_stop(&pg);
             t->res[k][rep].bytes = bytes;
             t->res[k][rep].elapsed_s = t1 - t0;
+            t->res[k][rep].span_s = t->span_acc;
             if (cfg.use_perf) {
                 t->res[k][rep].perf_valid = perf_read(&pg, t->res[k][rep].c, &t->res[k][rep].perf_why);
                 t->res[k][rep].perf_cov = pg.t_enabled ? (double)pg.t_running / (double)pg.t_enabled : 0.0;
@@ -413,13 +434,14 @@ static void usage(void)
     fprintf(stderr,
             "usage: bandwidth [--threads T --cpus LIST] [--bytes B] [--kernel read|write|copy|all|ldr16|str16|read-pf4|read-pf8|read-pf16|read-2s]\n"
             "                 [--passes P] [--reps R] [--mem dram|ocm|spm] [--ocm-regions 0,1,..] [--perf]\n"
-            "                 [--flush-before] [--flush-after] [--cme] [--asm-passes] [--no-hugetlb] [--no-thp] [--ocm-*/--spm-* overrides]\n"
+            "                 [--flush-before] [--flush-after] [--cme] [--asm-passes] [--dsb-st] [--no-hugetlb] [--no-thp] [--ocm-*/--spm-* overrides]\n"
             "  bytes is per thread and must be a multiple of 256 (1024 with --cme); cpus: \"2,4,6\" or \"2-9\" or \"2-8:2\"\n"
             "  --cme: run the kernels through the CME in streaming mode (needs SME2, SVL 64 B)\n"
             "  read-pf4/8/16: the read loop with a PRFM PLDL1KEEP on every line that many lines ahead; read-2s: two streams\n"
             "    over the two halves of the buffer (core kernels only, no CME form)\n"
             "  --perf: count the core prefetch set around the timed passes, printed per 64 B line (needs --threads 1)\n"
-            "  --asm-passes: read or write only, one segment, no --cme: all passes of a rep inside one assembly call\n");
+            "  --asm-passes: read or write only, one segment: all passes of a rep inside one assembly call (with --cme: one streaming span)\n"
+            "  --dsb-st: with --cme and the write kernel, default form: DSB ST before SMSTOP, so each call waits for its stores\n");
     exit(2);
 }
 
@@ -437,6 +459,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--cme")) cfg.cme = 1;
         else if (!strcmp(a, "--perf")) cfg.use_perf = 1;
         else if (!strcmp(a, "--asm-passes")) cfg.asm_passes = 1;
+        else if (!strcmp(a, "--dsb-st")) cfg.dsb_st = 1;
         else if (!strcmp(a, "--threads") && more) { cfg.threads = atoi(argv[++i]); threads_given = 1; }
         else if (!strcmp(a, "--cpus") && more) parse_cpus(argv[++i]);
         else if (!strcmp(a, "--bytes") && more) cfg.bytes = parse_bytes(argv[++i]);
@@ -471,8 +494,15 @@ int main(int argc, char **argv)
         int other = 0;
         for (int j = 0; j < K_COUNT; j++)
             if (cfg.run[j] && j != K_READ && j != K_WRITE) other = 1;
-        if (other || cfg.cme) { fprintf(stderr, "--asm-passes has the read and write kernels only, and no CME form\n"); usage(); }
+        if (other) { fprintf(stderr, "--asm-passes has the read and write kernels only\n"); usage(); }
+        if (cfg.dsb_st) { fprintf(stderr, "--dsb-st is the default (one call per pass) form only\n"); usage(); }
         if (cfg.kind == MEM_OCM && cfg.bytes > memcfg.ocm_size) { fprintf(stderr, "--asm-passes needs a one-segment buffer: at most one OCM region\n"); usage(); }
+    }
+    if (cfg.dsb_st) {
+        int other = 0;
+        for (int j = 0; j < K_COUNT; j++)
+            if (cfg.run[j] && j != K_WRITE) other = 1;
+        if (other || !cfg.cme) { fprintf(stderr, "--dsb-st needs --cme and the write kernel\n"); usage(); }
     }
     if (cfg.kind == MEM_SPM && (cfg.run[K_READ] || cfg.run[K_WRITE] || cfg.run[K_COPY]))
         fprintf(stderr, "warning: SPM accepts only aligned 8/16/32 B accesses; ldr16/str16 are the safe kernels\n");
@@ -480,9 +510,9 @@ int main(int argc, char **argv)
     struct thread *th = calloc((size_t)cfg.threads, sizeof *th);
     if (!th || pthread_barrier_init(&bar, NULL, (unsigned)cfg.threads + 1) != 0) { perror("setup"); return 2; }
     printf("# bandwidth: GB = 1e9 bytes; asm_kernels=%d threads=%d bytes_per_thread=%llu passes=%d reps=%d mem=%s "
-           "flush_before=%d flush_after=%d cme=%d asm_passes=%d cntfrq_hz=%llu\n", HAVE_ASM, cfg.threads,
+           "flush_before=%d flush_after=%d cme=%d asm_passes=%d dsb_st=%d cntfrq_hz=%llu\n", HAVE_ASM, cfg.threads,
            (unsigned long long)cfg.bytes, cfg.passes, cfg.reps, mem_name(cfg.kind), cfg.flush_before,
-           cfg.flush_after, cfg.cme, cfg.asm_passes, (unsigned long long)read_cntfrq());
+           cfg.flush_after, cfg.cme, cfg.asm_passes, cfg.dsb_st, (unsigned long long)read_cntfrq());
     for (int i = 0; i < cfg.threads; i++) {
         th[i].idx = i;
         th[i].cpu = cfg.ncpus ? cfg.cpus[i % cfg.ncpus] : -1;
@@ -491,6 +521,8 @@ int main(int argc, char **argv)
     pthread_barrier_wait(&bar); /* buffers allocated */
     printf("# backing=%s\n", th[0].a.backing);
     printf("mem,kernel,threads,bytes_per_thread,rep,total_bytes,elapsed_s,aggregate_GBps,per_thread_min_GBps,per_thread_max_GBps");
+    if (cfg.cme)
+        printf(",span_s,span_GBps"); /* the slowest thread's in-span time and the bytes over it; "-" when no span was stamped */
     if (pg.ok) {
         for (int i = 0; i < PERF_N; i++)
             printf(",%s_per_line", pg.names[i]);
@@ -499,17 +531,18 @@ int main(int argc, char **argv)
     printf("\n");
     for (int k = 0; k < K_COUNT; k++) {
         if (!cfg.run[k]) continue;
-        double best = 0;
+        double best = 0, best_span = 0;
         for (int rep = 0; rep < cfg.reps; rep++) {
             pthread_barrier_wait(&bar); /* start */
             pthread_barrier_wait(&bar); /* end */
             uint64_t total = 0;
-            double longest = 0, mn = 1e30, mx = 0;
+            double longest = 0, mn = 1e30, mx = 0, span = 0;
             for (int i = 0; i < cfg.threads; i++) {
                 struct result *r = &th[i].res[k][rep];
                 double g = (double)r->bytes / r->elapsed_s / 1e9;
                 total += r->bytes;
                 if (r->elapsed_s > longest) longest = r->elapsed_s;
+                if (r->span_s > span) span = r->span_s;
                 if (g < mn) mn = g;
                 if (g > mx) mx = g;
             }
@@ -517,6 +550,14 @@ int main(int argc, char **argv)
             if (agg > best) best = agg;
             printf("%s,%s%s,%d,%llu,%d,%llu,%.6f,%.3f,%.3f,%.3f", mem_name(cfg.kind), cfg.cme ? "cme-" : "", kernel_name[k], cfg.threads,
                    (unsigned long long)cfg.bytes, rep, (unsigned long long)total, longest, agg, mn, mx);
+            if (cfg.cme) {
+                if (span > 0) {
+                    double gs = (double)total / span / 1e9;
+                    if (gs > best_span) best_span = gs;
+                    printf(",%.9f,%.3f", span, gs);
+                } else
+                    printf(",-,-");
+            }
             if (pg.ok) { /* one thread: its counts per 64 B line moved in the timed passes, as latency.c prints them per load */
                 const struct result *r = &th[0].res[k][rep];
                 double lines = (double)r->bytes / LINE_BYTES;
@@ -537,6 +578,10 @@ int main(int argc, char **argv)
         }
         printf("%s,%s%s,%d,%llu,best,-,-,%.3f,-,-", mem_name(cfg.kind), cfg.cme ? "cme-" : "", kernel_name[k], cfg.threads,
                (unsigned long long)cfg.bytes, best);
+        if (cfg.cme) {
+            if (best_span > 0) printf(",-,%.3f", best_span);
+            else printf(",-,-");
+        }
         if (pg.ok)
             for (int i = 0; i <= PERF_N; i++) printf(",-");
         printf("\n");

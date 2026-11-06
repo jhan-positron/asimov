@@ -133,19 +133,19 @@ results:
 |---|---|
 | `common.h` | buffers in DRAM (MAP_HUGETLB, else THP, or 4 KiB pages with `--no-thp`), OCM regions, SPM; flush; core perf counters |
 | `latency.c` | single-thread pointer chase; `--fresh`, `--flush`, `--sparse`, `--sparse-vary`, `--seq`, `--perf`, `--events` |
-| `bandwidth.c` | pinned threads, read / write / copy with `ldp`/`stp` q-register pairs; `ldr16`/`str16` for SPM; `read-pf4`/`-pf8`/`-pf16` (the read loop with a software prefetch hint that many lines ahead) and `read-2s` (two streams); `--asm-passes` (read and write: all passes of a rep inside one assembly call, for the per-pass cost); `--perf` counts the prefetch set per line on one thread |
+| `bandwidth.c` | pinned threads, read / write / copy with `ldp`/`stp` q-register pairs; `ldr16`/`str16` for SPM; `read-pf4`/`-pf8`/`-pf16` (the read loop with a software prefetch hint that many lines ahead) and `read-2s` (two streams); `--asm-passes` (read and write: all passes of a rep inside one assembly call, for the per-pass cost; with `--cme`, one streaming span); `--dsb-st` (CME write with `DSB ST` before `SMSTOP`); `--perf` counts the prefetch set per line on one thread |
 | `bandwidth_r2.c` | run 2's bandwidth.c (commit 8ae533c) kept verbatim, built as `bandwidth_r2`: the control of run_followup.sh phase G5 for the per-pass write cost that run 3 added |
 | `bandwidth_r3.c` | run 3's bandwidth.c (commit ba834c0) kept verbatim, built as `bandwidth_r3`: the run 3 side of phase G5, since run 5 changed bandwidth.c |
 | `cmncount.c` | runs one command with mesh PMU events open (system-wide, on the PMU's CPU), appends one CSV line per event and one with the command's lifetime |
-| `cme_kern.S` | the chase and the read / write / copy loops again as streaming-mode SVE (`LD1D` + `LASTB`; `LD1B` / `ST1B` of four vectors and of one), used by `latency --cme` and `bandwidth --cme`; plus the register round trip and `RDSVL` |
-| `cme_test.c` | self-test of those kernels on any SME2 machine: chase, round trip, read fold, write pattern, copy; `make cme_test && ./cme_test` |
+| `cme_kern.S` | the chase and the read / write / copy loops again as streaming-mode SVE (`LD1D` + `LASTB`; `LD1B` / `ST1B` of four vectors and of one), used by `latency --cme` and `bandwidth --cme`; plus the register round trip and `RDSVL`. From run 6 every span reads `CNTVCT_EL0` after `SMSTART` and before `SMSTOP` into `cme_span`, and the single-call forms (`cme_read4_n`, `cme_write4_n`) and the `DSB ST` write (`cme_write4_dsb`) exist |
+| `cme_test.c` | self-test of those kernels on any SME2 machine: chase, round trip, read fold, write pattern, copy, the single-call forms, the `DSB ST` write and the span stamps; `make cme_test && ./cme_test` |
 | `run_followup.sh` | the run 3 follow-up (follow-up-run-plan.md): the OCM chase rows dense, sparse and vary from CPUs 2 and 8, the TLB and walk counter sets on the CPU 2 rows, each with its own validation row, the CME latency sweep, and a sequential chain as the prefetch stimulus, all with the prefetch-refill counters, plus the small one-core write rows with run 3's and run 2's bandwidth programs (G5) and the 20 dense OCM cells under the crosspoint flit counters (G6), the 64 KiB to 512 KiB chase rows with the L2 and L3 hit set (G1, run 5) and the one-core read rows with software prefetch distances and two streams under the prefetch counters (G7, run 5), and the one-core L1 rows at 4 to 24 KiB in the per-pass and `--asm-passes` forms (G8, run 5c); meant to run once per boot (normal, prefetchers off, larger OCM pages, both) |
 | `test_lat_rows.py` | test of the latency CSV reader in gen_run3.py over run 2, run 3 and run 4 row shapes, refused and invalid counters; `python3 test_lat_rows.py` |
 | `perf_cov_test.c` | host test that a multiplexed counter row is rejected and the next row is not; `make perf_cov_test && taskset -c 2 ./perf_cov_test` on an Arm machine |
 | `est_chip_time.py` | sizes a run from `sh run_asimov.sh --dry-run`: exact counts per command, labelled time assumptions |
 | `run_all.sh` | **the script to run**: the cache and mesh test, then the CME test, into one `results/<UTC time>/` directory |
 | `run_asimov.sh` | the cache and mesh test: phases 0, A, B, D, E and C (last, skipped without `/dev/asimov-spm`) |
-| `run_cme.sh` | the CME test: phase F (skipped when `/proc/cpuinfo` has no `sme2`); takes CPU 3 offline for its rows and brings it back |
+| `run_cme.sh` | the CME test: phase F and, from run 6, F2 (the per-call cost rows); skipped when `/proc/cpuinfo` has no `sme2`; takes CPU 3 offline for its rows and brings it back |
 | `lib_run.sh` | shared by both scripts: options, output directory, mesh counter settings, CPU sets, the `run` / `cmn` helpers |
 | `Makefile` | `make CC=<your aarch64 gcc>`; default flags `-O2 -mcpu=cortex-a520 -static`; links `cme_kern.S` when the compiler targets AArch64 |
 
@@ -224,6 +224,9 @@ Total size is a few tens of kilobytes.
 | F | CME bandwidth with single-vector (64 B) loads and stores | 16 KiB, 2 MiB, 32 MiB | the 64 B forms against the 256 B forms, as whole-kernel throughput; the fold differs too (8 against 16 accumulators), so a gap is not assigned to the load width alone |
 | F | per-call cost control: 1 KiB read and write calls, 4096 passes | 1 KiB | elapsed / 4096 is an upper bound on the `SMSTART`, register save, `SMSTOP` cost that every bandwidth pass pays (it includes 1 KiB of data and loop work); a 16 KiB pass pays it once per 16 KiB |
 | F | CME OCM read per region and all five, OCM streaming write | 256 KiB, 1.25 MiB | the phase D OCM rows through the CME |
+| F2 (run 6) | CME read and write in the looped form (one call per pass) and the single-call form (`--asm-passes`: one streaming span per rep), 5 reps | 4, 8, 16, 24 KiB (1,024, 512, 256, 176 passes) | each form's fixed cost per pass from a line fitted through its four rows (as the core's G8 rows); the two intercepts differ by what a call pays per pass outside its loop; every `--cme` row also prints its in-span time, so span against elapsed gives the same cost directly |
+| F2 (run 6) | CME write with `DSB ST` before `SMSTOP` (`--dsb-st`), looped form, 5 reps | 4, 8, 16, 24 KiB | whether a per-call cost appears once each call waits for its stores (the posted-store hypothesis of asimov-cme-perf.html) |
+| F2 (run 6) | per-call write rows, 2, 4 and 8 KiB per call, beside the 1 KiB row | 2 to 8 KiB (2,048 to 512 passes) | at which call size the per-call cost of a short write call (23 ns est. at 1 KiB on run 3) disappears |
 | E | shared-L2 pair, CPUs 2 and 3 | 16 KiB, 48 KiB, 160 KiB each | whether two cores sharing L2 and L3 halve each other's bandwidth |
 | E | one core per DSU (2, 4, 6, 8) and all eight (2 to 9) | 2 MiB and 16 MiB per thread | aggregate SLC and DRAM bandwidth of the hemisphere |
 | E | writer placement: 2 writers on CPUs 2+4, 2+8, 2+3; 4 writers on 2+4+6+8 (the control), 2+3+4+5, 2+3+8+9 | 16 MiB each | whether the hemisphere write limit (run 1: 86.8 GB/s at 16 MiB per writer, 88.8 at 2 MiB) depends on where the writers sit; a placement differs from the control only if the gap exceeds the spread of the repeats |
@@ -239,7 +242,10 @@ with a `# cme:` line otherwise, so a missing row says why. The CME rows run
 from CPU 2 with CPU 3 offline: the two cores of a DSU share one CME, and an
 idle partner core keeps the CME to CPU 2. Inside a streaming span the program
 makes no system call (a system call clears streaming mode and its Z and P
-state); the timer and counter reads sit outside the span. A signal cannot be
+state); the timer and counter reads sit outside the span. From run 6 each
+kernel also reads `CNTVCT_EL0` (a system register, legal in streaming mode)
+just after `SMSTART` and just before `SMSTOP`, and the rows print that in-span
+time beside the bracket time. A signal cannot be
 ruled out by the program: a handler runs outside streaming mode and the return
 restores the state, so the span survives, but the elapsed time then includes
 the handler. The run's isolated CPUs make that unlikely, and the reps show it
@@ -315,9 +321,14 @@ outer is a consistency check for this kernel, not an identity), and the first
 rows of the file are the `cme-roundtrip` control with `size_bytes` 0, then
 the `cme-call` rows: 64 complete one-hop calls timed together, per call
 (`loads` 64). A call holds the register save, `SMSTART`, one register hop,
-`SMSTOP` and the restore, plus the C loop around it; the parts are not
-separated. A sparse chase pass pays the same entry and exit once, so a short
-pass is read beside this row, not corrected by it.
+`SMSTOP` and the restore, plus the C loop around it. A sparse chase pass pays
+the same entry and exit once, so a short pass is read beside this row, not
+corrected by it. From run 6 every `--cme` row has one more column after
+`ns_per_load`, `ns_per_load_span`: the time the call spent inside its
+streaming span (`CNTVCT_EL0` after `SMSTART` and before `SMSTOP`) per load, so
+`ns_per_load` minus it is the register save, `SMSTART`, `SMSTOP` and restore
+of that call spread over its loads; the `cme-call` rows sum the spans of
+their 64 calls. The `best` rows keep their six fields.
 
 `bandwidth` prints one row per rep:
 
@@ -335,14 +346,23 @@ and `# perf:` conventions; the `best` row prints `-` in those columns. The
 `read-pf4`, `read-pf8` and `read-pf16` kernels are the read loop with a `PRFM
 PLDL1KEEP` on every line that many lines ahead of the loads; `read-2s` reads
 the two halves of the buffer as two streams, 128 B from each per iteration.
-Neither has a CME form. `--asm-passes` (read and write only, one segment, no
-CME form) runs all `--passes` passes of a rep inside one assembly call, so a
-rep pays one call, one return and one save of the callee-saved vector
-registers instead of one per pass. The inner loop's exit still runs once per
-pass. The header line records it as `asm_passes=1`. The default form and this
-form at the same size give the net cost of the default pass machinery (call,
-return, register save, the per-pass dispatch and accounting) against the
-assembly's own loop step (run_followup.sh G8).
+Neither has a CME form. `--asm-passes` (read and write only, one segment)
+runs all `--passes` passes of a rep inside one assembly call, so a rep pays
+one call, one return and one save of the callee-saved vector registers
+instead of one per pass. The inner loop's exit still runs once per pass. The
+header line records it as `asm_passes=1`. The default form and this form at
+the same size give the net cost of the default pass machinery (call, return,
+register save, the per-pass dispatch and accounting) against the assembly's
+own loop step (run_followup.sh G8). With `--cme` (run 6) the single-call form
+holds all passes of a rep in one streaming span, one `SMSTART` and `SMSTOP`
+per rep. Every `--cme` row carries two more columns after
+`per_thread_max_GBps`: `span_s`, the sum over the rep's kernel calls of the
+time each spent inside its streaming span (the slowest thread's), and
+`span_GBps`, the bytes over that time; `elapsed_s` minus `span_s` is what the
+rep's calls paid outside their spans. The `best` row prints `-` and the best
+`span_GBps`. `--dsb-st` (CME write, default form; header `dsb_st=1`) ends
+each call with `DSB ST` before `SMSTOP`, so the call and its span wait for
+the stores to complete (run_cme.sh F2).
 
 `cmncount` appends to `cmn-counts.csv`:
 
@@ -433,7 +453,10 @@ each). Phase F adds 33 commands and 48 launches: the phase A chase sizes once
 more through the CME, whose hops cost about ten times the core's from L1
 (21.6 ns against 2.0 ns, asimov-bench 2026-10-22), about 0.45 s, plus the
 control hops, chain builds, CME bandwidth and OCM rows (about 0.15 s) and the
-launch allowance (0.64 s). `sh run_asimov.sh --dry-run | python3
+launch allowance (0.64 s). Phase F2 (run 6) adds 23 commands and 23 launches,
+about 0.35 s (est.), almost all of it launch time; `sh run_cme.sh --dry-run |
+python3 est_chip_time.py` gives 56 commands, 71 launches, 1.7 s (est.) for
+the CME script. `sh run_asimov.sh --dry-run | python3
 est_chip_time.py` lists every command with exact counts and labelled
 assumptions: 95 commands, 156 launches, about 4 s (est.) in all, half of it
 the launch allowance, which nothing in the run measures.
