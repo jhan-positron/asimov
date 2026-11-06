@@ -94,7 +94,8 @@ if [ "$HAVE_SME2" = 1 ]; then
     # single-call form (all passes of a rep in one streaming span, --asm-passes,
     # cme-bandwidth-l1-asmpasses.csv), read and write, whose fitted intercepts give each form's
     # fixed cost per pass; the looped read without its end-of-call fold (--no-fold,
-    # cme-bandwidth-l1-nofold.csv), the matched control for the fold; a write row with DSB ST
+    # cme-bandwidth-l1-nofold.csv), whose difference from the looped read is the net effect of
+    # removing the final reduction and its return dependency; a write row with DSB ST
     # before SMSTOP (--dsb-st, cme-bandwidth-l1-dsb.csv), which makes each call wait for its stores
     # to complete; per-call write rows at 2, 4 and 8 KiB beside the 1 KiB row above, to see at which
     # size the per-call cost of a short write call disappears; and the single-call form at the 48 KiB

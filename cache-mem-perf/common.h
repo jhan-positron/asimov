@@ -534,7 +534,7 @@ static uint64_t cme_span[3];
 #endif
 /* The last call's in-span time in seconds (cme_span over the counter frequency); 0 on a host without the kernels.
  * cme_span_reset and cme_span_sum_s bracket a timed region from outside it: the kernels add each call's span to
- * cme_span[2] themselves, so no C code runs inside the caller's clock reads. */
+ * cme_span[2] themselves, so no C span collection runs inside the caller's clock reads. */
 static inline double cme_span_s(void)
 {
     uint64_t f = read_cntfrq();

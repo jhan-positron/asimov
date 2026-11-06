@@ -12,15 +12,20 @@
 // the kernel reads the counter-timer (ISB, then CNTVCT_EL0, a system register
 // read, legal in streaming mode) into cme_span[0] and cme_span[1], and adds
 // their difference to cme_span[2], a running sum the caller resets before a
-// timed bracket and reads after it (no C work inside the bracket). The span
-// is instrumented: inside it, after the first stamp, sit that stamp's store
-// and address setup (3 instructions) and, at the end, the ISB that waits for
-// the loop's instructions to complete (an in-order core, so a read span ends
-// after its last load has returned); outside it, before SMSTOP, sit the
-// second stamp's store and the sum (6 instructions). So bracket minus span
-// is the instrumented outside-span interval of the call: the register save,
-// SMSTART, SMSTOP, the restore, the caller's call and return, and those six
-// instructions. It is not the switch alone. A store's completion, which
+// timed bracket and reads after it (no C span collection inside the bracket;
+// the caller's own loop still runs there). The span is instrumented: inside
+// it, after the first stamp, sit that stamp's store and address setup (3
+// instructions) and, at the end, an ISB; outside it, before SMSTOP, sit the
+// second stamp's address setup, store and the sum (8 instructions). So
+// bracket minus span is the instrumented outside-span interval of the call:
+// the register save, SMSTART, SMSTOP, the restore, the caller's call and
+// return, and those eight instructions. It is not the switch alone. Whether
+// the ISB before the second stamp waits for the span's loads to return is
+// Insufficient data: the CME executes out of order and the core stalls on a
+// CME result in a general-purpose register (C1-Nano TRM; C1-SME2 TRM), so a
+// kernel whose last instruction depends on its loads (the folded read's
+// FMOV) ends its span differently from one that does not (cme_read4_nofold).
+// A store's completion, which
 // DSB ST waits for in cme_write4_dsb, is the point at which every observer
 // sees it; it is not the data reaching memory, and the CME L1 may hold the
 // written line (C1-SME2 TRM section 6.2).
@@ -51,7 +56,8 @@
 //   void     cme_write4_dsb(void *p, uint64_t bytes, uint64_t v)   cme_write4 with DSB ST before SMSTOP, so the
 //                                                       span and the call wait for the stores to complete
 //   uint64_t cme_read4_nofold(const void *p, uint64_t bytes)  cme_read4 without the end-of-call fold (returns 0):
-//                                                       the matched control for the fold's cost per call
+//                                                       the control for the net effect of the fold and its
+//                                                       FMOV return dependency
 //   uint64_t cme_span[3]                                CNTVCT_EL0 after SMSTART and before SMSTOP of the last
 //                                                       call, and the running sum of (end - start) over calls
 //
@@ -135,8 +141,10 @@ cme_roundtrip:
 	.size	cme_roundtrip, . - cme_roundtrip
 
 // cme_read4 and cme_read4_nofold share one body; the second skips the
-// end-of-call fold (15 EOR, EORV, FMOV) and returns 0, so the two differ in
-// the fold alone (run 6 control).
+// end-of-call fold (15 EOR, EORV, FMOV) and returns 0 (MOV). The two differ
+// in those instructions, and their timing difference is the net effect of
+// removing the reduction and the return dependency, overlap and completion
+// waiting included (run 6 control).
 .macro	CME_READ4 name, fold
 	.global	\name
 	.type	\name, %function

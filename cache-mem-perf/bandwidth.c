@@ -33,10 +33,10 @@
  * --cme rows carry two more columns (run 6): span_s, the sum over the timed
  *   passes of the time each kernel call spent inside its streaming span
  *   (CNTVCT_EL0 read after SMSTART and before SMSTOP, summed by the kernels
- *   themselves in cme_span[2]; no C code runs inside the bracket), and
+  *   themselves in cme_span[2]; no C span collection inside the bracket), and
  *   span_GBps, the bytes over that time. elapsed_s minus span_s is the
  *   instrumented outside-span interval of the rep's calls: register save,
- *   SMSTART, SMSTOP, restore, the C loop and the second stamp's six
+ *   SMSTART, SMSTOP, restore, the C loop and the second stamp's eight
  *   instructions, per rep. It is not the switch alone. --cme takes one
  *   worker: the stamps are one global pair.
  * --dsb-st (CME write, looped form): the write kernel ends with DSB ST
@@ -44,7 +44,8 @@
  *   (observable by every observer; not the data reaching memory). A control
  *   for the per-call cost of writes (cme_write4_dsb).
  * --no-fold (CME read, looped form): the read kernel without its end-of-call
- *   fold (cme_read4_nofold), the matched control for the fold's cost.
+ *   fold (cme_read4_nofold): the control for the net effect of removing
+ *   the final reduction and its return dependency.
  * --flush-before: DC CIVAC the buffer before each timed rep, so reads come
  *   from the home node (OCM / SLC), not from L1/L2/L3.
  * --flush-after: DC CIVAC inside the timed region after the passes, so a
@@ -407,7 +408,7 @@ static void *worker(void *arg)
                 flush_buf(&t->a);
             pthread_barrier_wait(&bar);
             perf_start(&pg);
-            cme_span_reset(); /* --cme: the kernels sum their spans into cme_span[2]; read after the bracket */
+            if (cfg.cme) cme_span_reset(); /* the kernels sum their spans into cme_span[2]; read after the bracket (one CME worker; core workers do not touch it) */
             double t0 = now_s();
             uint64_t bytes = 0;
             if (cfg.asm_passes)

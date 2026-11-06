@@ -64,10 +64,10 @@
  *   streaming span (CNTVCT_EL0 read after SMSTART and before SMSTOP, in
  *   cme_kern.S) per load. ns_per_load minus it is the instrumented
  *   outside-span interval of the call (register save, SMSTART, SMSTOP,
- *   restore, the call and return, and the second stamp's six instructions),
+ *   restore, the call and return, and the second stamp's eight instructions),
  *   spread over the loads; it is not the switch alone. The cme-call rows sum
  *   the 64 spans of their 64 calls (the kernels keep the sum in cme_span[2];
- *   no C code runs inside the bracket). --events cme-l3 with --cme swaps the
+ *   no C span collection inside the bracket). --events cme-l3 with --cme swaps the
  *   three refill-by-cause events for the CME's L3 hit, miss and refill
  *   events (0x328E, 0x328F, 0x3290), to be validated on the run 6 boots.
  * Counter columns: a row prints "-" for every counter, and a "# perf:" line
