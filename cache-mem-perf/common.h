@@ -392,10 +392,15 @@ static inline void perf_open_cme(struct perfgrp *g)
 /* The CME L3 set (--cme --events cme-l3, run 6): the two refill-source events plus 0x328E
  * CME_L3D_CACHE_HIT (L3 accesses by the CME that hit), 0x328F CME_L3D_CACHE_MISS (L3 demand
  * accesses by the CME that missed) and 0x3290 CME_L3D_CACHE_REFILL (L3 refills caused by the CME),
- * C1-SME2 TRM 107831 event table. Whether the three count on this platform, and what population
- * each takes, is validated on the run 6 boots before any row is read through them: on a boot with the
- * L3 in snoop-filter-only mode a hit count must read 0, and hit plus miss is compared with the inner
- * and outer refills on the same row. The read-refill event is not in this set (six counters). */
+ * C1-SME2 TRM 107831 event table. The three are collected as exploratory counts. Two checks are
+ * made and neither validates them: hit plus miss against inner plus outer on the same row compares
+ * two totals whose populations the TRM defines differently (L3 accesses, translation-resolution
+ * accesses included, against L1 line refills by source), so their agreement is a workload
+ * hypothesis, and it says nothing about how the first total divides into hits and misses; a hit
+ * count of 0 on a boot whose L3 holds no data is a necessary check that no run 6 boot provides.
+ * Until an independent control validates the hit and miss interpretation and the populations, no
+ * fit or attribution reads these columns (Insufficient data); the rows are reported as counts.
+ * The read-refill event is not in this set (six counters). */
 static inline void perf_open_cme_l3(struct perfgrp *g)
 {
     static const uint64_t raw[PERF_N] = { 0, 0x3246, 0x327D, 0x327E, 0x328E, 0x328F, 0x3290 };
