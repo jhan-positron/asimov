@@ -225,7 +225,7 @@ Total size is a few tens of kilobytes.
 | F | per-call cost control: 1 KiB read and write calls, 4096 passes | 1 KiB | elapsed / 4096 is an upper bound on the `SMSTART`, register save, `SMSTOP` cost that every bandwidth pass pays (it includes 1 KiB of data and loop work); a 16 KiB pass pays it once per 16 KiB |
 | F | CME OCM read per region and all five, OCM streaming write | 256 KiB, 1.25 MiB | the phase D OCM rows through the CME |
 | F2 (run 6) | CME read and write in the looped form (one call per pass) and the single-call form (`--asm-passes`: one streaming span per rep), 5 reps; the single-call form again at the sweep's 48 KiB to 256 KiB sizes, 3 reps | 4, 8, 16, 24 KiB (1,024, 512, 256, 176 passes); 48, 96, 160, 256 KiB | each form's fitted cost per pass from a line through its four rows (as the core's G8 rows) and their net difference, which holds every per-call difference between the forms (call, return, save, restore, the switch, the predicate and accumulator setup, the fold), not one part of it; every `--cme` row also prints its in-span time, so elapsed minus span is the instrumented outside-span interval of its calls |
-| F2 (run 6) | CME read without its end-of-call fold (`--no-fold`), looped form, 5 reps | 4, 8, 16, 24 KiB | the matched control for the fold: the looped read's fitted cost minus this row's is the fold's cost per call |
+| F2 (run 6) | CME read without its end-of-call fold (`--no-fold`), looped form, 5 reps | 4, 8, 16, 24 KiB | the matched control for the fold: the looped read's fitted cost minus this row's is the net effect of removing the final reduction and its return dependency, overlap and completion waiting included, not the execution cost of the removed instructions |
 | F2 (run 6) | CME write with `DSB ST` before `SMSTOP` (`--dsb-st`), looped form, 5 reps | 4, 8, 16, 24 KiB | the barrier's measured effect on the per-call cost of writes; the posted-store reading of asimov-cme-perf.html stays a hypothesis either way |
 | F2 (run 6) | per-call write rows, 2, 4 and 8 KiB per call, beside the 1 KiB row | 2 to 8 KiB (2,048 to 512 passes) | at which call size the per-call cost of a short write call (23 ns est. at 1 KiB on run 3) disappears |
 | F2 (run 6) | the CME chase sizes under the CME L3 events (`--events cme-l3`: 0x328E hit, 0x328F miss, 0x3290 refill, with the inner and outer refills) | 4 KiB to 32 MiB | first whether the three events count on this platform (0 hits with the L3 in snoop-filter-only mode; hit plus miss against the refills), then, on the prefetcher-off boot, which level served the loads |
@@ -249,10 +249,16 @@ kernel also reads `CNTVCT_EL0` (a system register, legal in streaming mode)
 just after `SMSTART` and just before `SMSTOP`, keeps a running sum of the
 spans, and the rows print that in-span time beside the bracket time. The
 span is instrumented: it holds the first stamp's store and address setup and
-the closing `ISB`; the call holds the second stamp's store and the sum as
-well. So bracket minus span is the instrumented outside-span interval of a
-call, not the switch alone. `--cme` takes one worker, since the stamps are
-one global pair. A signal cannot be
+the closing `ISB`; the call holds the second stamp's address setup, store and
+the sum (eight instructions) as well. So bracket minus span is the
+instrumented outside-span interval of a call, not the switch alone, and work
+inside the span is in both numbers, so their difference does not show it.
+Whether that closing `ISB` waits for the span's loads to return is
+Insufficient data (the CME executes out of order and the core stalls on a
+CME result in a general-purpose register), so a kernel that ends on a result
+of its loads (the folded read) and one that does not (`--no-fold`) end their
+spans differently. `--cme` takes one worker, since the stamps are one global
+pair, and core workers never touch them. A signal cannot be
 ruled out by the program: a handler runs outside streaming mode and the return
 restores the state, so the span survives, but the elapsed time then includes
 the handler. The run's isolated CPUs make that unlikely, and the reps show it
